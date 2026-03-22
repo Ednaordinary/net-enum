@@ -3,8 +3,6 @@ extern crate pnet;
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::interfaces;
 use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
-use pnet::packet::tcp::TcpFlags;
-use pnet::packet::udp::UdpPacket;
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
@@ -17,7 +15,7 @@ use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
 use xsk_rs::config::{BindFlags, FrameSize, QueueSize, SocketConfig, UmemConfig, XdpFlags};
-use xsk_rs::{CompQueue, FrameDesc, Socket, TxQueue, Umem};
+use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
 use std::env;
 use std::io::Write;
@@ -25,60 +23,45 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::time::Duration;
 
-fn recv(mut rx: Box<dyn DataLinkReceiver>, mac: Option<MacAddr>, ranges: Vec<Ipv4Cidr>) {
-    loop {
-        match rx.next() {
-            Ok(packet) => {
-                let packet_vec: Vec<u8>;
-                match mac.is_some() {
-                    true => {
-                        let eth = EthernetPacket::new(packet).unwrap();
-                        packet_vec = eth.payload().to_vec();
-                    }
-                    false => {
-                        packet_vec = packet.to_vec();
-                    }
-                }
-                let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
-                let source = ip_packet.get_source();
-                // println!("src {}", source);
-                for range in ranges.clone() {
-                    if range.contains(&source) {
-                        println!("from: {:02X?}", packet_vec);
-                        match ip_packet.get_next_level_protocol() {
-                            IpNextHeaderProtocols::Tcp => {
-                                let tcp_packet: TcpPacket =
-                                    TcpPacket::new(ip_packet.payload()).unwrap();
-                                if tcp_packet.get_flags() != 18 {
-                                    continue;
-                                };
-                                println!(
-                                    "Tcp {0}:{1} -> {2}:{3} - SYN ACK",
-                                    ip_packet.get_source(),
-                                    tcp_packet.get_source().to_string(),
-                                    ip_packet.get_destination().to_string(),
-                                    tcp_packet.get_destination().to_string(),
-                                );
-                            }
-                            //IpNextHeaderProtocols::Udp => {
-                            //    let udp_packet: UdpPacket =
-                            //        UdpPacket::new(ip_packet.payload()).unwrap();
-                            //    println!(
-                            //        "Udp {0}:{1} -> {2}:{3} - 4",
-                            //        ip_packet.get_source(),
-                            //        udp_packet.get_source().to_string(),
-                            //        ip_packet.get_destination().to_string(),
-                            //        udp_packet.get_destination().to_string(),
-                            //    )
-                            //}
-                            _ => {}
-                        }
-                        continue;
-                    }
-                }
+fn handle_recv(packet: &[u8], ranges: &Vec<Ipv4Cidr>) {
+    let eth = EthernetPacket::new(packet).unwrap();
+    let packet_vec = eth.payload().to_vec();
+    let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
+    let source = ip_packet.get_source();
+    let in_range = ranges.iter().any(|range| range.contains(&source));
+    if in_range {
+        println!("from: {:02X?}", packet_vec);
+        match ip_packet.get_next_level_protocol() {
+            IpNextHeaderProtocols::Tcp => {
+                let tcp_packet: TcpPacket = TcpPacket::new(ip_packet.payload()).unwrap();
+                println!(
+                    "Tcp {0}:{1} -> {2}:{3} - {4}",
+                    ip_packet.get_source(),
+                    tcp_packet.get_source().to_string(),
+                    ip_packet.get_destination().to_string(),
+                    tcp_packet.get_destination().to_string(),
+                    tcp_packet.get_flags().to_string(),
+                );
             }
-            Err(e) => {
-                println!("Error while receiving packet: {}", e)
+            _ => {}
+        }
+    }
+}
+
+fn recv(
+    mut rx_q: RxQueue,
+    mut fq: FillQueue,
+    descs: &mut [FrameDesc],
+    umem: &Umem,
+    ranges: &Vec<Ipv4Cidr>,
+) {
+    loop {
+        unsafe {
+            fq.produce(descs);
+            let packets = rx_q.poll_and_consume(descs, 100).unwrap();
+            for packet in descs.iter().take(packets) {
+                let data = umem.data(packet);
+                //handle_recv(data.contents(), ranges);
             }
         }
     }
@@ -158,7 +141,7 @@ fn send_packets(
     remote_ports: Vec<u16>,
     gate_mac: MacAddr,
     mac: Option<MacAddr>,
-    tx_umem: Umem,
+    tx_umem: &Umem,
     mut tx_q: TxQueue,
     packet_batch_size: u16,
     mut cq: CompQueue,
@@ -182,7 +165,7 @@ fn send_packets(
         }
     }
     for remote_port in remote_ports {
-        //println!("Now scanning port {}", remote_port);
+        println!("Now scanning port {}", remote_port);
         //std::thread::sleep(std::time::Duration::from_millis(2000));
         let start_time = std::time::Instant::now();
         let mut ip_buffer = [0; 40];
@@ -226,8 +209,11 @@ fn send_packets(
                     let mut cursor = mut_data.cursor();
                     // cursor.set_pos(0);
                     let final_pack = &[eth_packet_buff, packet.packet()].concat();
-                    println!("to: {:02X?}", final_pack);
-                    cursor.write_all(final_pack).unwrap();
+                    //println!("to: {:02X?}", final_pack);
+                    let write_res = cursor.write_all(final_pack).err();
+                    if write_res.is_some() {
+                        println!("Could not write full frame buffer {}", allowed_write);
+                    }
                     //content_ptr[0..final_pack.len()] = final_pack;
                     //.cursor()
                     //.write_all(&[eth_packet_buff, packet.packet()].concat())
@@ -242,9 +228,7 @@ fn send_packets(
                     while !tx_q.poll(100).unwrap() {
                         println!("poll failed");
                     }
-                    while { tx_q.produce_one(&mut tx_descs[allowed_write as usize]) } != 1 as usize
-                    {
-                    }
+                    while { tx_q.produce_one(&tx_descs[allowed_write as usize]) } != 1 as usize {}
                 }
                 if allowed_write < 1 {
                     while consumed == 0 {
@@ -262,6 +246,7 @@ fn send_packets(
             }
         }
         let mut remaining = packet_batch_size - allowed_write - 1;
+        println!("remainder {}", remaining);
         unsafe {
             while remaining > 0 {
                 while !tx_q.poll(100).unwrap() {
@@ -323,67 +308,78 @@ fn main() {
     ranges.push(range);
     let ips = calculate_ips(ranges);
     let mut ports: Vec<u16> = Vec::new();
-    ports.push(scan_port);
-    //(20000..20100).for_each(|x| ports.push(x)); // Use this to add a range instead
+    //ports.push(scan_port);
+    (1..1001).for_each(|x| ports.push(x)); // Use this to add a range instead
     let ifs = interfaces();
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
     let gate = default_net::get_default_gateway().unwrap();
-    let (_, rx) = craft_transport(&interface);
+    //let (_, rx) = craft_transport(&interface);
     let mac: Option<MacAddr> = interface.mac;
     let ips_clone = ips.clone();
-    std::thread::spawn(move || {
-        recv(rx, mac, ips_clone);
-    });
+    //std::thread::spawn(move || {
+    //    recv(rx, mac, ips_clone);
+    //});
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
-    let (tx_umem, mut tx_descs) = Umem::new(
+    let (dev_umem, mut dev_descs) = Umem::new(
         UmemConfig::builder()
-            //.comp_queue_size(QueueSize::new(65536).unwrap())
-            .frame_size(FrameSize::new(2048).unwrap())
+            .comp_queue_size(QueueSize::new(65536).unwrap())
+            .fill_queue_size(QueueSize::new(65536).unwrap())
+            //.frame_size(FrameSize::new(2048).unwrap())
             .build()
             .unwrap(),
         tx_buffer.try_into().unwrap(),
         false,
     )
     .expect("Could not create UMEM");
-    let (tx_q, _rx_q, cq) = unsafe {
+    let desc_len = dev_descs.len();
+    println!("Desc len {}", desc_len);
+    let (rx_descs, tx_descs) = dev_descs.split_at_mut(desc_len / 2);
+    let (tx_q, rx_q, fq_cq) = unsafe {
         Socket::new(
             SocketConfig::builder()
-                .tx_queue_size(QueueSize::new(65536 * 8).unwrap())
-                .bind_flags(BindFlags::XDP_USE_NEED_WAKEUP)
+                .tx_queue_size(QueueSize::new(65536 * 1024).unwrap())
+                //.bind_flags(BindFlags::XDP_ZEROCOPY)
                 .xdp_flags(XdpFlags::XDP_FLAGS_DRV_MODE)
                 .build(),
-            &tx_umem,
+            &dev_umem,
             &interface.name.parse().unwrap(),
             0,
         )
     }
     .expect("Failed tx creation");
-    let ip = interface.ips.first().unwrap().ip();
-    println!("if: {}", interface.name);
-    match ip {
-        IpAddr::V4(v4_addr) => {
-            println!("{}", v4_addr);
-            let (packets, packets_size) = send_packets(
-                &v4_addr,
-                &ips,
-                34567,
-                ports,
-                gate_mac,
-                mac,
-                tx_umem,
-                tx_q,
-                tx_buffer as u16,
-                cq.unwrap().1,
-                &mut tx_descs,
-            )
-            .unwrap();
-            std::thread::sleep(Duration::from_secs(2));
-            println!("Packets sent: {}", packets);
-            println!("Total packets: {}", packets_size);
+    let (fq, cq) = fq_cq.expect("Failed to create fill queue and comp queue");
+    std::thread::scope(|s| {
+        let umem_ref = &dev_umem;
+        s.spawn(move || {
+            recv(rx_q, fq, rx_descs, umem_ref, &ips_clone);
+        });
+        let ip = interface.ips.first().unwrap().ip();
+        println!("if: {}", interface.name);
+        match ip {
+            IpAddr::V4(v4_addr) => {
+                println!("{}", v4_addr);
+                let (packets, packets_size) = send_packets(
+                    &v4_addr,
+                    &ips,
+                    34567,
+                    ports,
+                    gate_mac,
+                    mac,
+                    &dev_umem,
+                    tx_q,
+                    (tx_buffer / 2) as u16,
+                    cq,
+                    tx_descs,
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_secs(2));
+                println!("Packets sent: {}", packets);
+                println!("Total packets: {}", packets_size);
+            }
+            IpAddr::V6(_) => {
+                println!("Source is v6! Not implemented");
+            }
         }
-        IpAddr::V6(_) => {
-            println!("Source is v6! Not implemented");
-        }
-    }
+    });
 }
