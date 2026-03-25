@@ -14,12 +14,13 @@ use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
-use xsk_rs::config::{BindFlags, FrameSize, QueueSize, SocketConfig, UmemConfig, XdpFlags};
+use xsk_rs::config::{BindFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
 use std::env;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
+use std::ops::Deref;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -132,6 +133,90 @@ fn sum_be_words(data: &[u8], skipword: usize) -> u32 {
     }
 
     sum
+}
+
+fn craft_tcp_packet_inplace(mut ipv4_packet: MutableIpv4Packet, ip: &Ipv4Addr, partial_sum: u32) {
+    ipv4_packet.set_destination(ip.to_owned());
+    ipv4_packet.set_checksum(pnet::packet::ipv4::checksum(&ipv4_packet.to_immutable()));
+    let mut part_sum = partial_sum;
+    part_sum += ipv4_word_sum(&ip);
+    part_sum += sum_be_words(ipv4_packet.packet(), 8);
+    let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut()).unwrap();
+    tcp_packet.set_checksum(finalize_checksum(part_sum));
+}
+
+fn write_tcp_packet(packet: &[u8], umem: Umem, desc: &mut FrameDesc) {
+    unsafe {
+        let mut mut_frame = umem.data_mut(desc);
+        let mut cursor = mut_frame.cursor();
+        let write_res = cursor.write_all(packet).err();
+        if write_res.is_some() {
+            println!("Failed to write full frame buffer");
+        }
+    }
+}
+
+fn fill_descs(
+    descs: &mut [FrameDesc],
+    umem: Umem,
+    ips: Vec<&Ipv4Addr>,
+    partial_sum: u32,
+    ipv4_packet: &[u8],
+) {
+    descs.iter_mut().zip(ips).for_each(|(desc, ip)| {
+        let mut vec_packet = ipv4_packet.to_vec();
+        let packet = MutableIpv4Packet::new(&mut vec_packet).unwrap();
+        craft_tcp_packet_inplace(packet, ip, partial_sum);
+        write_tcp_packet(&mut vec_packet, umem.clone(), desc); // should probably rewrite this to not clone
+    });
+}
+
+fn send_loop(
+    descs: &mut [FrameDesc],
+    umem: Umem,
+    ips: Vec<Ipv4Addr>,
+    partial_sum: u32,
+    ipv4_packet: MutableIpv4Packet,
+    mut tx_q: TxQueue,
+    mut cq: CompQueue,
+) {
+    let mut ips_iter = ips.iter();
+    let mut fill_amt = descs.len();
+    loop {
+        let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
+        let chunk_len = ip_chunk.len();
+        if chunk_len == 0 {
+            break;
+        }
+        fill_descs(
+            &mut descs[..chunk_len],
+            umem.clone(),
+            ip_chunk,
+            partial_sum,
+            ipv4_packet.packet(),
+        );
+        unsafe {
+            while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() } < 1 {}
+            fill_amt = 0;
+            while fill_amt == 0 {
+                fill_amt = cq.consume(&mut descs[..])
+            }
+        }
+    }
+}
+
+fn send_packets_new(
+    source_ip: &Ipv4Addr,
+    remote_ips: &Vec<Ipv4Addr>,
+    source_port: u16,
+    remote_ports: Vec<u16>,
+    gate_mac: MacAddr,
+    mac: MacAddr,
+    umem: Umem,
+    mut tx_q: TxQueue,
+    mut cq: CompQueue,
+    descs: &mut [FrameDesc],
+) -> Result<u64, Box<dyn std::error::Error>> {
 }
 
 fn send_packets(
