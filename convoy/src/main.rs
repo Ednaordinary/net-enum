@@ -24,12 +24,12 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::time::Duration;
 
-fn handle_recv(packet: &[u8], ranges: &Vec<Ipv4Cidr>) {
+fn handle_recv(packet: &[u8], range: &Vec<Ipv4Addr>) {
     let eth = EthernetPacket::new(packet).unwrap();
     let packet_vec = eth.payload().to_vec();
     let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
     let source = ip_packet.get_source();
-    let in_range = ranges.iter().any(|range| range.contains(&source));
+    let in_range = range.contains(&source);
     if in_range {
         println!("from: {:02X?}", packet_vec);
         match ip_packet.get_next_level_protocol() {
@@ -54,7 +54,7 @@ fn recv(
     mut fq: FillQueue,
     descs: &mut [FrameDesc],
     umem: &Umem,
-    ranges: &Vec<Ipv4Cidr>,
+    range: &Vec<Ipv4Addr>,
 ) {
     loop {
         unsafe {
@@ -62,7 +62,7 @@ fn recv(
             let packets = rx_q.poll_and_consume(descs, 100).unwrap();
             for packet in descs.iter().take(packets) {
                 let data = umem.data(packet);
-                //handle_recv(data.contents(), ranges);
+                handle_recv(data.contents(), range);
             }
         }
     }
@@ -145,7 +145,7 @@ fn craft_tcp_packet_inplace(mut ipv4_packet: MutableIpv4Packet, ip: &Ipv4Addr, p
     tcp_packet.set_checksum(finalize_checksum(part_sum));
 }
 
-fn write_tcp_packet(packet: &[u8], umem: Umem, desc: &mut FrameDesc) {
+fn write_tcp_packet(packet: &[u8], umem: &Umem, desc: &mut FrameDesc) {
     unsafe {
         let mut mut_frame = umem.data_mut(desc);
         let mut cursor = mut_frame.cursor();
@@ -162,29 +162,32 @@ fn fill_descs(
     ips: Vec<&Ipv4Addr>,
     partial_sum: u32,
     ipv4_packet: &[u8],
+    eth_packet: &[u8],
 ) {
-    descs.iter_mut().zip(ips).for_each(|(desc, ip)| {
-        let mut vec_packet = ipv4_packet.to_vec();
+    for (desc, ip) in descs.iter_mut().zip(ips) {
+        let mut vec_packet = [eth_packet, ipv4_packet].concat().to_vec();
         let packet = MutableIpv4Packet::new(&mut vec_packet).unwrap();
         craft_tcp_packet_inplace(packet, ip, partial_sum);
-        write_tcp_packet(&mut vec_packet, umem.clone(), desc); // should probably rewrite this to not clone
-    });
+        write_tcp_packet(&mut vec_packet, &umem, desc);
+    }
 }
 
 fn send_loop(
     descs: &mut [FrameDesc],
-    umem: Umem,
-    ips: Vec<Ipv4Addr>,
+    umem: &Umem,
+    ips: &Vec<Ipv4Addr>,
     partial_sum: u32,
-    ipv4_packet: MutableIpv4Packet,
-    mut tx_q: TxQueue,
-    mut cq: CompQueue,
-) {
+    ipv4_packet: &MutableIpv4Packet,
+    eth_packet: &[u8],
+    tx_q: &mut TxQueue,
+    cq: &mut CompQueue,
+    mut fill_amt: usize,
+) -> usize {
     let mut ips_iter = ips.iter();
-    let mut fill_amt = descs.len();
     loop {
         let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
         let chunk_len = ip_chunk.len();
+        //println!("chunk len {}", chunk_len);
         if chunk_len == 0 {
             break;
         }
@@ -194,32 +197,78 @@ fn send_loop(
             ip_chunk,
             partial_sum,
             ipv4_packet.packet(),
+            eth_packet,
         );
         unsafe {
+            while !tx_q.poll(100).unwrap() {
+                println!("poll failed");
+            }
             while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() } < 1 {}
             fill_amt = 0;
             while fill_amt == 0 {
                 fill_amt = cq.consume(&mut descs[..])
             }
+            //println!("fill amt {}", fill_amt);
         }
     }
+    fill_amt
 }
 
-fn send_packets_new(
+fn send_packets(
     source_ip: &Ipv4Addr,
     remote_ips: &Vec<Ipv4Addr>,
     source_port: u16,
     remote_ports: Vec<u16>,
     gate_mac: MacAddr,
     mac: MacAddr,
-    umem: Umem,
+    umem: &Umem,
     mut tx_q: TxQueue,
     mut cq: CompQueue,
     descs: &mut [FrameDesc],
 ) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut part_sum = ipv4_word_sum(source_ip);
+    let IpNextHeaderProtocol(protocol) = IpNextHeaderProtocols::Tcp;
+    part_sum += protocol as u32;
+    part_sum += 20; // data len
+    let mut eth_buffer = [0; 14];
+    craft_eth_packet(mac, gate_mac, &mut eth_buffer);
+    let mut ip_buffer = [0; 40];
+    let mut ip_packet = craft_ip_packet(*source_ip, &mut ip_buffer);
+    let tcp_seq = rand::random::<u32>();
+    {
+        let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+        base_packet.set_source(source_port);
+        base_packet.set_sequence(tcp_seq);
+        base_packet.set_window(64240);
+        base_packet.set_flags(SYN);
+        base_packet.set_data_offset(5);
+        base_packet.set_reserved(0);
+        base_packet.set_urgent_ptr(0);
+    }
+    //let mut packet = MutableIpv4Packet::from(ip_packet);
+    let mut fill_amt = descs.len();
+    for port in remote_ports.iter() {
+        println!("port {}", port);
+        {
+            let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
+            base_packet.set_destination(*port);
+        }
+        fill_amt = send_loop(
+            descs,
+            &umem,
+            remote_ips,
+            part_sum,
+            &ip_packet,
+            &eth_buffer,
+            &mut tx_q,
+            &mut cq,
+            fill_amt,
+        );
+    }
+    Ok((remote_ports.len() * remote_ips.len()) as u64)
 }
 
-fn send_packets(
+fn send_packets_old(
     source_ip: &Ipv4Addr,
     remote_ips: &Vec<Ipv4Cidr>,
     source_port: u16,
@@ -365,10 +414,11 @@ fn send_packets(
     Ok((packets, packets_size))
 }
 
-fn calculate_ips(ranges: Vec<String>) -> Vec<Ipv4Cidr> {
-    let ips: Vec<Ipv4Cidr> = ranges
-        .into_iter()
-        .map(|x| Ipv4Cidr::from_str(&x).expect(&format!("Could not parse {}", x)))
+fn calculate_ips(range: String) -> Vec<Ipv4Addr> {
+    let ips: Vec<Ipv4Addr> = Ipv4Cidr::from_str(&range)
+        .expect(&format!("Could not parse {}", range))
+        .iter()
+        .map(|inet| inet.address())
         .collect();
     ips
 }
@@ -389,9 +439,7 @@ fn main() {
     let range = env::args().nth(1).unwrap();
     let scan_port = env::args().nth(2).unwrap().parse::<u16>().unwrap();
     let tx_buffer = 65536;
-    let mut ranges: Vec<String> = Vec::new();
-    ranges.push(range);
-    let ips = calculate_ips(ranges);
+    let ips = calculate_ips(range);
     let mut ports: Vec<u16> = Vec::new();
     //ports.push(scan_port);
     (1..1001).for_each(|x| ports.push(x)); // Use this to add a range instead
@@ -400,7 +448,7 @@ fn main() {
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
     let gate = default_net::get_default_gateway().unwrap();
     //let (_, rx) = craft_transport(&interface);
-    let mac: Option<MacAddr> = interface.mac;
+    let mac: MacAddr = interface.mac.unwrap();
     let ips_clone = ips.clone();
     //std::thread::spawn(move || {
     //    recv(rx, mac, ips_clone);
@@ -423,8 +471,7 @@ fn main() {
     let (tx_q, rx_q, fq_cq) = unsafe {
         Socket::new(
             SocketConfig::builder()
-                .tx_queue_size(QueueSize::new(65536 * 1024).unwrap())
-                //.bind_flags(BindFlags::XDP_ZEROCOPY)
+                .tx_queue_size(QueueSize::new(65536 * 8).unwrap())
                 .xdp_flags(XdpFlags::XDP_FLAGS_DRV_MODE)
                 .build(),
             &dev_umem,
@@ -444,23 +491,13 @@ fn main() {
         match ip {
             IpAddr::V4(v4_addr) => {
                 println!("{}", v4_addr);
-                let (packets, packets_size) = send_packets(
-                    &v4_addr,
-                    &ips,
-                    34567,
-                    ports,
-                    gate_mac,
-                    mac,
-                    &dev_umem,
-                    tx_q,
-                    (tx_buffer / 2) as u16,
-                    cq,
-                    tx_descs,
+                let packets = send_packets(
+                    &v4_addr, &ips, 34567, ports, gate_mac, mac, &dev_umem, tx_q, cq, tx_descs,
                 )
                 .unwrap();
                 std::thread::sleep(Duration::from_secs(2));
                 println!("Packets sent: {}", packets);
-                println!("Total packets: {}", packets_size);
+                println!("Total size (bits): {}", packets * 54);
             }
             IpAddr::V6(_) => {
                 println!("Source is v6! Not implemented");
