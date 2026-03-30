@@ -20,7 +20,6 @@ use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 use std::env;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
-use std::ops::Deref;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -140,8 +139,8 @@ fn craft_tcp_packet_inplace(mut ipv4_packet: MutableIpv4Packet, ip: &Ipv4Addr, p
     ipv4_packet.set_checksum(pnet::packet::ipv4::checksum(&ipv4_packet.to_immutable()));
     let mut part_sum = partial_sum;
     part_sum += ipv4_word_sum(&ip);
-    part_sum += sum_be_words(ipv4_packet.packet(), 8);
     let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut()).unwrap();
+    part_sum += sum_be_words(tcp_packet.packet(), 8);
     tcp_packet.set_checksum(finalize_checksum(part_sum));
 }
 
@@ -158,16 +157,17 @@ fn write_tcp_packet(packet: &[u8], umem: &Umem, desc: &mut FrameDesc) {
 
 fn fill_descs(
     descs: &mut [FrameDesc],
-    umem: Umem,
+    umem: &Umem,
     ips: Vec<&Ipv4Addr>,
     partial_sum: u32,
     ipv4_packet: &[u8],
     eth_packet: &[u8],
 ) {
     for (desc, ip) in descs.iter_mut().zip(ips) {
-        let mut vec_packet = [eth_packet, ipv4_packet].concat().to_vec();
+        let mut vec_packet = ipv4_packet.to_vec();
         let packet = MutableIpv4Packet::new(&mut vec_packet).unwrap();
         craft_tcp_packet_inplace(packet, ip, partial_sum);
+        vec_packet = [eth_packet, &vec_packet].concat().to_vec();
         write_tcp_packet(&mut vec_packet, &umem, desc);
     }
 }
@@ -193,7 +193,7 @@ fn send_loop(
         }
         fill_descs(
             &mut descs[..chunk_len],
-            umem.clone(),
+            umem,
             ip_chunk,
             partial_sum,
             ipv4_packet.packet(),
