@@ -1,8 +1,6 @@
 extern crate pnet;
 
-use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::interfaces;
-use pnet::datalink::{self, DataLinkReceiver, DataLinkSender, NetworkInterface};
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
@@ -14,7 +12,7 @@ use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
 use cidr_utils::cidr::Ipv4Cidr;
-use xsk_rs::config::{BindFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
+use xsk_rs::config::{QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
 use std::env;
@@ -30,7 +28,6 @@ fn handle_recv(packet: &[u8], range: &Vec<Ipv4Addr>) {
     let source = ip_packet.get_source();
     let in_range = range.contains(&source);
     if in_range {
-        println!("from: {:02X?}", packet_vec);
         match ip_packet.get_next_level_protocol() {
             IpNextHeaderProtocols::Tcp => {
                 let tcp_packet: TcpPacket = TcpPacket::new(ip_packet.payload()).unwrap();
@@ -187,7 +184,6 @@ fn send_loop(
     loop {
         let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
         let chunk_len = ip_chunk.len();
-        //println!("chunk len {}", chunk_len);
         if chunk_len == 0 {
             break;
         }
@@ -208,7 +204,6 @@ fn send_loop(
             while fill_amt == 0 {
                 fill_amt = cq.consume(&mut descs[..])
             }
-            //println!("fill amt {}", fill_amt);
         }
     }
     fill_amt
@@ -268,152 +263,6 @@ fn send_packets(
     Ok((remote_ports.len() * remote_ips.len()) as u64)
 }
 
-fn send_packets_old(
-    source_ip: &Ipv4Addr,
-    remote_ips: &Vec<Ipv4Cidr>,
-    source_port: u16,
-    remote_ports: Vec<u16>,
-    gate_mac: MacAddr,
-    mac: Option<MacAddr>,
-    tx_umem: &Umem,
-    mut tx_q: TxQueue,
-    packet_batch_size: u16,
-    mut cq: CompQueue,
-    tx_descs: &mut [FrameDesc],
-) -> Result<(u64, u64), Box<dyn std::error::Error>> {
-    let mut packets = 0u64;
-    let mut packets_size = 0u64;
-    let mut eth_buffer = [0; 14];
-    let eth_packet;
-    let eth_packet_buff: &[u8];
-    let mut allowed_write = packet_batch_size - 1;
-    println!("allowed_write: {}", allowed_write);
-    let mut consumed = 0;
-    match mac {
-        Some(mac) => {
-            eth_packet = craft_eth_packet(mac, gate_mac, &mut eth_buffer);
-            eth_packet_buff = eth_packet.packet();
-        }
-        None => {
-            eth_packet_buff = &[0; 0];
-        }
-    }
-    for remote_port in remote_ports {
-        println!("Now scanning port {}", remote_port);
-        //std::thread::sleep(std::time::Duration::from_millis(2000));
-        let start_time = std::time::Instant::now();
-        let mut ip_buffer = [0; 40];
-        let tcp_seq = rand::random::<u32>();
-        let mut ip_packet = craft_ip_packet(*source_ip, &mut ip_buffer);
-        {
-            let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
-            base_packet.set_source(source_port);
-            base_packet.set_destination(remote_port);
-            base_packet.set_sequence(tcp_seq);
-            base_packet.set_window(64240);
-            base_packet.set_flags(SYN);
-            base_packet.set_data_offset(5);
-            base_packet.set_reserved(0);
-            base_packet.set_urgent_ptr(0);
-        }
-        let mut packet = MutableIpv4Packet::from(ip_packet);
-        let mut unfinished_sum = 0u32;
-        let mut dyn_sum: u32;
-        unfinished_sum += ipv4_word_sum(source_ip);
-        let protocol = IpNextHeaderProtocols::Tcp;
-        let IpNextHeaderProtocol(protocol) = protocol;
-        unfinished_sum += protocol as u32;
-        unfinished_sum += 20; // data.len()
-        for ip_set in remote_ips {
-            for ip in ip_set.iter().addresses() {
-                packet.set_destination(ip);
-
-                packet.set_checksum(pnet::packet::ipv4::checksum(&packet.to_immutable()));
-                let mut base_packet = MutableTcpPacket::new(packet.payload_mut()).unwrap();
-                dyn_sum = unfinished_sum;
-                dyn_sum += ipv4_word_sum(&ip);
-                dyn_sum += sum_be_words(base_packet.packet(), 8);
-                base_packet.set_checksum(finalize_checksum(dyn_sum));
-                // base_packet.set_sequence(base_packet.get_sequence() + 1);
-                packets += 1;
-                packets_size += packet.packet().len() as u64;
-                packets_size += eth_packet_buff.len() as u64;
-                unsafe {
-                    let mut mut_data = tx_umem.data_mut(&mut tx_descs[allowed_write as usize]);
-                    let mut cursor = mut_data.cursor();
-                    // cursor.set_pos(0);
-                    let final_pack = &[eth_packet_buff, packet.packet()].concat();
-                    //println!("to: {:02X?}", final_pack);
-                    let write_res = cursor.write_all(final_pack).err();
-                    if write_res.is_some() {
-                        println!("Could not write full frame buffer {}", allowed_write);
-                    }
-                    //content_ptr[0..final_pack.len()] = final_pack;
-                    //.cursor()
-                    //.write_all(&[eth_packet_buff, packet.packet()].concat())
-                    //.unwrap_or_else(|_x| {
-                    //    println!(
-                    //        "allowed_write: {}\nconsumed: {}\nlen: {}",
-                    //        allowed_write,
-                    //        consumed,
-                    //        tx_descs.len()
-                    //    )
-                    //});
-                    while !tx_q.poll(100).unwrap() {
-                        println!("poll failed");
-                    }
-                    while { tx_q.produce_one(&tx_descs[allowed_write as usize]) } != 1 as usize {}
-                }
-                if allowed_write < 1 {
-                    while consumed == 0 {
-                        unsafe {
-                            consumed += cq.consume(&mut tx_descs[..]) as u16;
-                        }
-                        if consumed == 0 && tx_q.needs_wakeup() {
-                            tx_q.wakeup().unwrap();
-                        }
-                    }
-                    allowed_write = consumed;
-                    consumed = 0;
-                }
-                allowed_write -= 1;
-            }
-        }
-        let mut remaining = packet_batch_size - allowed_write - 1;
-        println!("remainder {}", remaining);
-        unsafe {
-            while remaining > 0 {
-                while !tx_q.poll(100).unwrap() {
-                    println!("poll failed (outer)");
-                }
-                let mut fr_recv = 0;
-                while fr_recv == 0 {
-                    fr_recv = cq.consume(&mut tx_descs[..]);
-                    // println!("consumed {}", fr_recv);
-                    if fr_recv == 0 {
-                        if tx_q.needs_wakeup() {
-                            tx_q.wakeup().unwrap();
-                        }
-                    }
-                    break;
-                }
-                remaining -= fr_recv as u16;
-            }
-            allowed_write = packet_batch_size - 1;
-            consumed = 0;
-        }
-        let end_time = std::time::Instant::now();
-        let time_taken = end_time - start_time;
-        //std::thread::sleep(std::time::Duration::from_millis(1000));
-        //println!(
-        //    "Packets per second ({}): {}",
-        //    remote_port,
-        //    packets as u128 * 1000000 / time_taken.as_micros()
-        //);
-    }
-    Ok((packets, packets_size))
-}
-
 fn calculate_ips(range: String) -> Vec<Ipv4Addr> {
     let ips: Vec<Ipv4Addr> = Ipv4Cidr::from_str(&range)
         .expect(&format!("Could not parse {}", range))
@@ -421,18 +270,6 @@ fn calculate_ips(range: String) -> Vec<Ipv4Addr> {
         .map(|inet| inet.address())
         .collect();
     ips
-}
-
-fn craft_transport(
-    interface: &NetworkInterface,
-) -> (Box<dyn DataLinkSender>, Box<dyn DataLinkReceiver>) {
-    let mut config = datalink::Config::default();
-    config.read_timeout = Some(Duration::from_secs(1));
-    match datalink::channel(interface, config) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Bad channel type"),
-        Err(e) => panic!("Error: {}", e),
-    }
 }
 
 fn main() {
