@@ -19,7 +19,7 @@ use std::env;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn handle_recv(packet: &[u8], range: &Vec<Ipv4Addr>) {
     let eth = EthernetPacket::new(packet).unwrap();
@@ -181,7 +181,21 @@ fn send_loop(
     mut fill_amt: usize,
 ) -> usize {
     let mut ips_iter = ips.iter();
+    let mut count: u32 = 0;
+    let mut packets_count: usize = 0;
+    let mut start = Instant::now();
     loop {
+        count += 1;
+        if count.rem_euclid(1000) == 0 {
+            print!(
+                "\rpps {}  ",
+                packets_count * 1000 / start.elapsed().as_millis() as usize
+            );
+            std::io::stdout().flush().unwrap();
+            start = Instant::now();
+            count = 0;
+            packets_count = 0;
+        }
         let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
         let chunk_len = ip_chunk.len();
         if chunk_len == 0 {
@@ -196,16 +210,18 @@ fn send_loop(
             eth_packet,
         );
         unsafe {
-            while !tx_q.poll(100).unwrap() {
-                println!("poll failed");
-            }
+            //while !tx_q.poll(100).unwrap() {
+            //    println!("poll failed");
+            //}
             while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() } < 1 {}
             fill_amt = 0;
             while fill_amt == 0 {
                 fill_amt = cq.consume(&mut descs[..])
             }
+            packets_count += fill_amt;
         }
     }
+    print!("\r          \r");
     fill_amt
 }
 
@@ -279,7 +295,7 @@ fn main() {
     let ips = calculate_ips(range);
     let mut ports: Vec<u16> = Vec::new();
     //ports.push(scan_port);
-    (1..1001).for_each(|x| ports.push(x)); // Use this to add a range instead
+    (1..50000).for_each(|x| ports.push(x)); // Use this to add a range instead
     let ifs = interfaces();
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
@@ -334,7 +350,7 @@ fn main() {
                 .unwrap();
                 std::thread::sleep(Duration::from_secs(2));
                 println!("Packets sent: {}", packets);
-                println!("Total size (bits): {}", packets * 54);
+                println!("Total size (bytes): {}", packets * 54);
             }
             IpAddr::V6(_) => {
                 println!("Source is v6! Not implemented");
