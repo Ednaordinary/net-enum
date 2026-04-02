@@ -188,7 +188,7 @@ fn send_loop(
         count += 1;
         if count.rem_euclid(1000) == 0 {
             print!(
-                "\rpps {}  ",
+                "pps {}  \r",
                 packets_count * 1000 / start.elapsed().as_millis() as usize
             );
             std::io::stdout().flush().unwrap();
