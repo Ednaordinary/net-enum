@@ -290,12 +290,17 @@ fn calculate_ips(range: String) -> Vec<Ipv4Addr> {
 
 fn main() {
     let range = env::args().nth(1).unwrap();
-    let scan_port = env::args().nth(2).unwrap().parse::<u16>().unwrap();
+    let mut ports: Vec<u16> = Vec::new();
+    let scan_range_1 = env::args().nth(2).unwrap().parse::<u16>().unwrap();
+    let scan_range_2 = env::args().nth(3).unwrap_or("".to_string());
+    if scan_range_2 != "" {
+        let scan_range_2 = scan_range_2.parse::<u16>().unwrap();
+        (scan_range_1..scan_range_2).for_each(|x| ports.push(x));
+    } else {
+        ports.push(scan_range_1);
+    }
     let tx_buffer = 65536;
     let ips = calculate_ips(range);
-    let mut ports: Vec<u16> = Vec::new();
-    //ports.push(scan_port);
-    (1..50000).for_each(|x| ports.push(x)); // Use this to add a range instead
     let ifs = interfaces();
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
