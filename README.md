@@ -2,10 +2,11 @@
 
 This is my collection of random networking scripts. It started as just a brute force DNS enumerator, but also now has an unnecessarily fast port scanner. I've marked scripts that can pretty easily kill stuff with a *
 
-## Convoy (WIP) *
+## Convoy *
 
 - Scans any CIDR IP range and port range using the low level XDP linux feature
 - Millions of ports scanned per second with a single core
+- `sudo convoy 0.0.0.0/0 443` or `sudo convoy 0.0.0.0/0 1 1000` for a range
 
 ## DNS Enum *
 
