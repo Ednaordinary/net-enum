@@ -4,7 +4,7 @@ This is my collection of random networking scripts. It started as just a brute f
 
 ## Convoy *
 
-- Scans any CIDR IP range and port range using the low level XDP linux feature
+- Scans any CIDR IP range and port range using AF_XDP linux kernel sockets
 - Millions of ports scanned per second with a single core
 - `sudo convoy 0.0.0.0/0 443` or `sudo convoy 0.0.0.0/0 1 1000` for a range
 
