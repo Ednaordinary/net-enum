@@ -186,21 +186,7 @@ fn send_loop(
     mut fill_amt: usize,
 ) -> usize {
     let mut ips_iter = ips.iter();
-    let mut count: u32 = 0;
-    let mut packets_count: usize = 0;
-    let mut start = Instant::now();
     loop {
-        count += 1;
-        if count.rem_euclid(1000) == 0 {
-            //print!(
-            //    "pps {}  \r",
-            //    packets_count * 1000 / start.elapsed().as_millis() as usize
-            //);
-            std::io::stdout().flush().unwrap();
-            start = Instant::now();
-            count = 0;
-            packets_count = 0;
-        }
         let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
         let chunk_len = ip_chunk.len();
         if chunk_len == 0 {
@@ -221,9 +207,8 @@ fn send_loop(
             while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() } < 1 {}
             fill_amt = 0;
             while fill_amt == 0 {
-                { fill_amt = cq.consume(&mut descs[..]) }
+                fill_amt = cq.consume(&mut descs[..])
             }
-            packets_count += fill_amt;
         }
     }
     //print!("\r          \r");
@@ -295,7 +280,7 @@ fn calculate_ips(range: String) -> Vec<Ipv4Addr> {
 
 fn make_socket(
     interface: &NetworkInterface,
-    tx_buffer: u32,
+    buffer: u32,
     q_id: u32,
 ) -> (
     (TxQueue, RxQueue, Option<(FillQueue, CompQueue)>),
@@ -310,7 +295,7 @@ fn make_socket(
             //.frame_size(FrameSize::new(2048).unwrap())
             .build()
             .unwrap(),
-        tx_buffer.try_into().unwrap(),
+        buffer.try_into().unwrap(),
         false,
     )
     .unwrap();
@@ -342,6 +327,7 @@ async fn main() {
     } else {
         ports.push(scan_range_1);
     }
+    let tx_amt = 2;
     let ips = calculate_ips(range);
     let packets: u128 = ports.len() as u128 * ips.len() as u128;
     println!("Sending: {}", packets);
@@ -350,48 +336,75 @@ async fn main() {
     let if_default = default_net::get_default_interface().unwrap();
     let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
     let gate = default_net::get_default_gateway().unwrap();
-    //let (_, rx) = craft_transport(&interface);
     let mac: MacAddr = interface.mac.unwrap();
-    let ips_clone = ips.clone();
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
-
-    let ip_chunks = ips.chunks(1000000);
-    let ((_tx_q, rx_q, fq_cq), umem, mut descs) = make_socket(&interface, 1024, 0);
-    let (fq, _cq) = fq_cq.expect("Failed to create fill queue and comp queue");
-    tokio::task::spawn_blocking(move || {
-        recv(rx_q, fq, &mut descs, &umem, &ips_clone);
-    });
+    let ip_len = ips.len();
+    let ip_chunks = ips.chunks(ip_len / tx_amt);
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
-    let mut q_id = 1;
+    let mut q_id: u32 = 0;
+    let start = Instant::now();
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
             for (idx, ip_chunk) in ip_chunks.enumerate() {
                 println!("{}", idx);
-                let ((tx_q, _rx_q, fq_cq), umem, mut descs) = make_socket(&interface, 1024, q_id);
+                if q_id == (tx_amt - 1) as u32 {
+                    let ((tx_q, rx_q, fq_cq), umem, mut descs) =
+                        make_socket(&interface, 2048, q_id);
+                    let desc_len = descs.len();
+                    let (mut rx_desc, mut tx_desc) = descs.split_at_mut(desc_len / 2);
+                    let (fq, mut cq) = fq_cq.unwrap();
+                    let ips_clone = ips.clone();
+                    std::thread::scope(|s| {
+                        let umem_ref = &umem;
+                        s.spawn(move || {
+                            recv(rx_q, fq, &mut rx_desc, umem_ref, &ips_clone);
+                        });
+                        let ip_ref = ip_chunk.to_vec();
+                        let ports_clone = ports.clone();
+                        send_packets(
+                            &v4_addr,
+                            &ip_ref,
+                            34567,
+                            ports_clone,
+                            gate_mac,
+                            mac,
+                            &umem,
+                            tx_q,
+                            &mut cq,
+                            &mut tx_desc,
+                        )
+                        .unwrap();
+                        let elapsed = start.elapsed().as_millis();
+                        std::thread::sleep(Duration::from_secs(2));
+                        println!("meowtime {:.2}", packets * 1000 / elapsed);
+                        return;
+                    });
+                } else {
+                    let ((tx_q, _rx_q, fq_cq), umem, mut descs) =
+                        make_socket(&interface, 1024, q_id);
+                    let (_fq, mut cq) = fq_cq.unwrap();
+                    let ip_ref = ip_chunk.to_vec();
+                    let ports_clone = ports.clone();
+                    tokio::task::spawn_blocking(move || {
+                        send_packets(
+                            &v4_addr,
+                            &ip_ref,
+                            34567,
+                            ports_clone,
+                            gate_mac,
+                            mac,
+                            &umem,
+                            tx_q,
+                            &mut cq,
+                            &mut descs,
+                        )
+                        .unwrap();
+                    });
+                }
                 q_id += 1;
-                let (_fq, mut cq) = fq_cq.unwrap();
-                let ip_ref = ip_chunk.to_vec();
-                let ports_clone = ports.clone();
-                //let cq_clone = Arc::clone(&cq_arc);
-                tokio::task::spawn_blocking(move || {
-                    send_packets(
-                        &v4_addr,
-                        &ip_ref,
-                        34567,
-                        ports_clone,
-                        gate_mac,
-                        mac,
-                        &umem,
-                        tx_q,
-                        &mut cq,
-                        &mut descs,
-                    )
-                    .unwrap();
-                });
             }
-            std::thread::sleep(Duration::from_secs(2));
         }
         IpAddr::V6(_) => {
             println!("Source is v6! Not implemented");
