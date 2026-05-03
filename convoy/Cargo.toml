@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cidr-utils = "0.6.2"
 default-net = "0.22.0"
 libc = "0.2.178"
 pnet = "0.35.0"
@@ -14,3 +13,4 @@ xsk-rs = "0.8.0"
 libxdp-sys = "=0.2.2"
 tokio = { version = "1", features = ["full"] }
 async-scoped = { version = "0.9.0", features = ["use-tokio"] }
+ipnet = "2.12.0"
