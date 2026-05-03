@@ -184,13 +184,28 @@ fn send_loop(
     tx_q: &mut TxQueue,
     cq: &mut CompQueue,
     mut fill_amt: usize,
+    send_mul: u32,
 ) -> usize {
     let mut ips_iter = ips.iter();
+    let mut sent: usize = 0;
+    let mut count: u32 = 0;
+    let mut start = Instant::now();
     loop {
+        count += 1;
         let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
         let chunk_len = ip_chunk.len();
         if chunk_len == 0 {
             break;
+        }
+        if send_mul != 0 && count.rem_euclid(1000) == 0 {
+            print!(
+                "pps {}   \r",
+                sent * send_mul as usize * 1000 / start.elapsed().as_millis() as usize
+            );
+            std::io::stdout().flush().unwrap();
+            count = 0;
+            sent = 0;
+            start = Instant::now();
         }
         fill_descs(
             &mut descs[..chunk_len],
@@ -209,9 +224,12 @@ fn send_loop(
             while fill_amt == 0 {
                 fill_amt = cq.consume(&mut descs[..])
             }
+            sent += fill_amt;
         }
     }
-    //print!("\r          \r");
+    if send_mul != 0 {
+        print!("\r          \r");
+    }
     fill_amt
 }
 
@@ -226,6 +244,7 @@ fn send_packets(
     mut tx_q: TxQueue,
     cq: &mut CompQueue,
     descs: &mut [FrameDesc],
+    send_mul: u32,
 ) -> Result<u128, Box<dyn std::error::Error>> {
     let mut part_sum = ipv4_word_sum(source_ip);
     let IpNextHeaderProtocol(protocol) = IpNextHeaderProtocols::Tcp;
@@ -264,6 +283,7 @@ fn send_packets(
             &mut tx_q,
             cq,
             fill_amt,
+            send_mul,
         );
     }
     Ok((remote_ports.len() * remote_ips.len()) as u128)
@@ -327,7 +347,7 @@ async fn main() {
     } else {
         ports.push(scan_range_1);
     }
-    let tx_amt = 2;
+    let tx_amt = 4;
     let ips = calculate_ips(range);
     let packets: u128 = ports.len() as u128 * ips.len() as u128;
     println!("Sending: {}", packets);
@@ -374,6 +394,7 @@ async fn main() {
                             tx_q,
                             &mut cq,
                             &mut tx_desc,
+                            tx_amt as u32,
                         )
                         .unwrap();
                         let elapsed = start.elapsed().as_millis();
@@ -399,6 +420,7 @@ async fn main() {
                             tx_q,
                             &mut cq,
                             &mut descs,
+                            0,
                         )
                         .unwrap();
                     });
