@@ -342,7 +342,7 @@ async fn main() {
     } else {
         ports.push(scan_range_1);
     }
-    let tx_amt: u32 = 1;
+    let tx_amt: u32 = 4;
     let ips = calculate_ips(range);
     let packets: u128 = ports.len() as u128 * 2u128.pow(32 - ips.prefix_len() as u32) as u128;
     println!("Sending: {}", packets);
@@ -355,6 +355,7 @@ async fn main() {
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
     let ip_len = 2u128.pow(32 - ips.prefix_len() as u32);
     let chunk_prefix = std::cmp::min(32, ips.prefix_len() + tx_amt.ilog2() as u8);
+    let chunk_amt = 2.pow(chunk_prefix - ips.prefix_len());
     let ip_chunks = ips.subnets(chunk_prefix).unwrap();
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
@@ -365,7 +366,7 @@ async fn main() {
             println!("{}", v4_addr);
             for (idx, ip_chunk) in ip_chunks.enumerate() {
                 println!("{}", idx);
-                if q_id == (tx_amt - 1) as u32 {
+                if q_id == (chunk_amt - 1) as u32 {
                     let ((tx_q, rx_q, fq_cq), umem, mut descs) =
                         make_socket(&interface, 2048, q_id);
                     let desc_len = descs.len();
