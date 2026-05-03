@@ -355,7 +355,7 @@ async fn main() {
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
     let ip_len = 2u128.pow(32 - ips.prefix_len() as u32);
     let chunk_prefix = std::cmp::min(32, ips.prefix_len() + tx_amt.ilog2() as u8);
-    let chunk_amt = 2_i32.pow(chunk_prefix - ips.prefix_len());
+    let chunk_amt = 2_i32.pow((chunk_prefix - ips.prefix_len()) as u32);
     let ip_chunks = ips.subnets(chunk_prefix).unwrap();
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
