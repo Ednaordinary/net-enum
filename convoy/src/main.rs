@@ -12,7 +12,7 @@ use pnet::packet::{
 use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
-use cidr_utils::cidr::Ipv4Cidr;
+use ipnet::Ipv4Net;
 use tokio::task::JoinSet;
 use xsk_rs::config::{QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use async_scoped::TokioScope;
 
-fn handle_recv(packet: &[u8], range: &Vec<Ipv4Addr>) {
+fn handle_recv(packet: &[u8], range: &Ipv4Net) {
     let eth = EthernetPacket::new(packet).unwrap();
     let packet_vec = eth.payload().to_vec();
     let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
@@ -55,7 +55,7 @@ fn recv(
     mut fq: FillQueue,
     descs: &mut [FrameDesc],
     umem: &Umem,
-    range: &Vec<Ipv4Addr>,
+    range: &Ipv4Net,
 ) {
     loop {
         unsafe {
@@ -136,7 +136,7 @@ fn sum_be_words(data: &[u8], skipword: usize) -> u32 {
     sum
 }
 
-fn craft_tcp_packet_inplace(mut ipv4_packet: MutableIpv4Packet, ip: &Ipv4Addr, partial_sum: u32) {
+fn craft_tcp_packet_inplace(mut ipv4_packet: MutableIpv4Packet, ip: Ipv4Addr, partial_sum: u32) {
     ipv4_packet.set_destination(ip.to_owned());
     ipv4_packet.set_checksum(pnet::packet::ipv4::checksum(&ipv4_packet.to_immutable()));
     let mut part_sum = partial_sum;
@@ -160,7 +160,7 @@ fn write_tcp_packet(packet: &[u8], umem: &Umem, desc: &mut FrameDesc) {
 fn fill_descs(
     descs: &mut [FrameDesc],
     umem: &Umem,
-    ips: Vec<&Ipv4Addr>,
+    ips: Vec<Ipv4Addr>,
     partial_sum: u32,
     ipv4_packet: &[u8],
     eth_packet: &[u8],
@@ -177,7 +177,7 @@ fn fill_descs(
 fn send_loop(
     descs: &mut [FrameDesc],
     umem: &Umem,
-    ips: &Vec<Ipv4Addr>,
+    ips: &Ipv4Net,
     partial_sum: u32,
     ipv4_packet: &MutableIpv4Packet,
     eth_packet: &[u8],
@@ -186,13 +186,12 @@ fn send_loop(
     mut fill_amt: usize,
     send_mul: u32,
 ) -> usize {
-    let mut ips_iter = ips.iter();
     let mut sent: usize = 0;
     let mut count: u32 = 0;
     let mut start = Instant::now();
     loop {
         count += 1;
-        let ip_chunk: Vec<&Ipv4Addr> = ips_iter.by_ref().take(fill_amt).collect();
+        let ip_chunk: Vec<Ipv4Addr> = ips.hosts().take(fill_amt).collect();
         let chunk_len = ip_chunk.len();
         if chunk_len == 0 {
             break;
@@ -235,7 +234,7 @@ fn send_loop(
 
 fn send_packets(
     source_ip: &Ipv4Addr,
-    remote_ips: &Vec<Ipv4Addr>,
+    remote_ips: &Ipv4Net,
     source_port: u16,
     remote_ports: Vec<u16>,
     gate_mac: MacAddr,
@@ -286,15 +285,11 @@ fn send_packets(
             send_mul,
         );
     }
-    Ok((remote_ports.len() * remote_ips.len()) as u128)
+    Ok(remote_ports.len() as u128 * 2u128.pow(remote_ips.prefix_len() as u32))
 }
 
-fn calculate_ips(range: String) -> Vec<Ipv4Addr> {
-    let ips: Vec<Ipv4Addr> = Ipv4Cidr::from_str(&range)
-        .expect(&format!("Could not parse {}", range))
-        .iter()
-        .map(|inet| inet.address())
-        .collect();
+fn calculate_ips(range: String) -> Ipv4Net {
+    let ips: Ipv4Net = Ipv4Net::from_str(&range).expect(&format!("Could not parse {}", range));
     ips
 }
 
@@ -324,7 +319,7 @@ fn make_socket(
         Socket::new(
             SocketConfig::builder()
                 .tx_queue_size(QueueSize::new(1024).unwrap())
-                .xdp_flags(XdpFlags::XDP_FLAGS_DRV_MODE)
+                .xdp_flags(XdpFlags::XDP_FLAGS_SKB_MODE)
                 .build(),
             &umem,
             &interface.name.parse().unwrap(),
@@ -347,9 +342,9 @@ async fn main() {
     } else {
         ports.push(scan_range_1);
     }
-    let tx_amt = 4;
+    let tx_amt: u32 = 1;
     let ips = calculate_ips(range);
-    let packets: u128 = ports.len() as u128 * ips.len() as u128;
+    let packets: u128 = ports.len() as u128 * 2u128.pow(32 - ips.prefix_len() as u32) as u128;
     println!("Sending: {}", packets);
     println!("Total size (bytes): {}", packets * 54);
     let ifs = interfaces();
@@ -358,8 +353,9 @@ async fn main() {
     let gate = default_net::get_default_gateway().unwrap();
     let mac: MacAddr = interface.mac.unwrap();
     let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
-    let ip_len = ips.len();
-    let ip_chunks = ips.chunks(ip_len / tx_amt);
+    let ip_len = 2u128.pow(32 - ips.prefix_len() as u32);
+    let chunk_prefix = std::cmp::min(32, ips.prefix_len() + tx_amt.ilog2() as u8);
+    let ip_chunks = ips.subnets(chunk_prefix).unwrap();
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
     let mut q_id: u32 = 0;
@@ -381,7 +377,7 @@ async fn main() {
                         s.spawn(move || {
                             recv(rx_q, fq, &mut rx_desc, umem_ref, &ips_clone);
                         });
-                        let ip_ref = ip_chunk.to_vec();
+                        let ip_ref = ip_chunk;
                         let ports_clone = ports.clone();
                         send_packets(
                             &v4_addr,
@@ -406,7 +402,7 @@ async fn main() {
                     let ((tx_q, _rx_q, fq_cq), umem, mut descs) =
                         make_socket(&interface, 1024, q_id);
                     let (_fq, mut cq) = fq_cq.unwrap();
-                    let ip_ref = ip_chunk.to_vec();
+                    let ip_ref = ip_chunk;
                     let ports_clone = ports.clone();
                     tokio::task::spawn_blocking(move || {
                         send_packets(
