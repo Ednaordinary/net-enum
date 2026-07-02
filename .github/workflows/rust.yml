@@ -22,11 +22,11 @@ jobs:
     - name: Build
       run: cd convoy && cargo build -r --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cd convoy && cargo test --verbose
     - name: Release
       env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: gh release create ${{ github.ref_name }} \
-            target/release/convoy \
+            convoy/target/release/convoy \
             --title "Convoy release ${{ github.ref_name }}" \
             --generate-notes
