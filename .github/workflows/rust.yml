@@ -19,14 +19,9 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install deps
       run: sudo apt update && sudo apt install -y libelf-dev tcpdump libpcap-dev
-    - name: Build
-      run: cd convoy && cargo build -r --verbose
-    - name: Run tests
-      run: cd convoy && cargo test --verbose
-    - name: Release
+    - name: Build -> Test -> Releae
       env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: gh release create ${{ github.ref_name }} \\
-            convoy/target/release/convoy \\
-            --title "Convoy release ${{ github.ref_name }}" \\
-            --generate-notes
+      run: cd convoy && cargo build -r --verbose && cargo test --verbose && gh release create ${{ github.ref_name }} target/release/convoy --title "Convoy release ${{ github.ref_name }}" --generate-notes
+    - name: Run tests
+      run: cd convoy && cargo test --verbose
