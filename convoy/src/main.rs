@@ -22,8 +22,30 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use clap::Parser;
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
+
+/// A speedy af_xdp port scanner
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// CIDR range of IPs to scan
+    #[arg(short, long)]
+    range: String,
+
+    /// TX queues to use
+    #[arg(long, default_value_t = 1)]
+    tx: u8,
+
+    /// Port range start
+    #[arg(short)]
+    b: u16,
+
+    /// Port range end
+    #[arg(short, default_value_t = 0)]
+    e: u16,
+}
 
 #[derive(Clone, PartialEq)]
 struct Metadata {
@@ -238,7 +260,6 @@ fn send_loop(
         // let ip_chunk: Vec<Ipv4Addr> = hosts.next();
         let ip_chunk: Vec<Ipv4Addr> = ip_chunk.collect();
         let chunk_len = ip_chunk.len();
-        println!("{}", chunk_len);
         if chunk_len == 0 {
             break;
         }
@@ -313,7 +334,7 @@ fn send_packets(
     //let mut packet = MutableIpv4Packet::from(ip_packet);
     let mut fill_amt = descs.len();
     for port in remote_ports.iter() {
-        println!("port {}", port);
+        println!("Port {}", port);
         {
             let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
             base_packet.set_destination(*port);
@@ -348,7 +369,6 @@ fn make_socket(
     Umem,
     Vec<FrameDesc>,
 ) {
-    println!("making socket");
     let (umem, descs) = Umem::new(
         UmemConfig::builder()
             .comp_queue_size(QueueSize::new(1024).unwrap())
@@ -360,7 +380,6 @@ fn make_socket(
         false,
     )
     .unwrap();
-    println!("made umem");
     let socket = unsafe {
         Socket::new(
             SocketConfig::builder()
@@ -378,17 +397,15 @@ fn make_socket(
 
 #[tokio::main]
 async fn main() {
-    let range = env::args().nth(1).unwrap();
+    let args = Args::parse();
+    let range = args.range;
     let mut ports: Vec<u16> = Vec::new();
-    let scan_range_1 = env::args().nth(2).unwrap().parse::<u16>().unwrap();
-    let scan_range_2 = env::args().nth(3).unwrap_or("".to_string());
-    if scan_range_2 != "" {
-        let scan_range_2 = scan_range_2.parse::<u16>().unwrap();
-        (scan_range_1..scan_range_2).for_each(|x| ports.push(x));
+    if args.e != 0 {
+        (args.b..args.e).for_each(|x| ports.push(x));
     } else {
-        ports.push(scan_range_1);
+        ports.push(args.b);
     }
-    let tx_amt: u32 = 1;
+    let tx_amt: u32 = args.tx as u32;
     let ips = calculate_ips(range);
     let packets: u128 = ports.len() as u128 * 2u128.pow(32 - ips.prefix_len() as u32) as u128;
     println!("Sending: {}", packets);
@@ -411,7 +428,6 @@ async fn main() {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
             for (idx, ip_chunk) in ip_chunks.enumerate() {
-                println!("{}", idx);
                 if q_id == (chunk_amt - 1) as u32 {
                     let ((tx_q, rx_q, fq_cq), umem, mut descs) =
                         make_socket(&interface, 2048, q_id);
