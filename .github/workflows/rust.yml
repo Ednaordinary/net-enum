@@ -18,7 +18,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install deps
-      run: sudo apt update && sudo apt install -y libelf-dev
+      run: sudo apt update && sudo apt install -y libelf-dev tcpdump libpcap-dev
     - name: Build
       run: cd convoy && cargo build -r --verbose
     - name: Run tests
