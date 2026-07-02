@@ -22,4 +22,14 @@ jobs:
     - name: Build -> Test -> Release
       env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: cd convoy && cargo build -r --verbose && cargo test --verbose && gh release create ${{ github.ref_name }} target/release/convoy --title "Convoy release ${{ github.ref_name }} (x86)" --generate-notes
+      run: |
+        cd convoy
+        cargo build -r --verbose
+        cargo test --verbose
+        git fetch --tags origin
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.1")
+        VERSION=${LATEST_TAG#v}
+        BASE_VERSION=$(echo "$VERSION" | cut -d. -f1-2)
+        PATCH_VERSION=$(echo "$VERSION" | cut -d. -f3)
+        NEXT_TAG="v${BASE_VERSION}.$((PATCH_VERSION + 1))"
+        gh release create "$NEXT_TAG" target/release/convoy --title "Convoy release "$NEXT_TAG" (x86)" --generate-notes
