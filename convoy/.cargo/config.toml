@@ -1,0 +1,4 @@
+[env]
+CFLAGS = { value = "-Wno-error", relative = false }
+EXTRA_CFLAGS = { value = "-Wno-error", relative = false }
+CLANG = { value = "clang -Wno-error=unused-command-line-argument", relative = false }

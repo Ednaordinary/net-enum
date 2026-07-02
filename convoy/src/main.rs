@@ -1,5 +1,6 @@
 extern crate pnet;
 
+use ipnet::Ipv4Net;
 use pnet::datalink::{NetworkInterface, interfaces};
 use pnet::packet::{
     MutablePacket, Packet,
@@ -11,7 +12,6 @@ use pnet::packet::{
 use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
-use ipnet::Ipv4Net;
 use xsk_rs::config::{QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
@@ -19,7 +19,11 @@ use std::env;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use itertools::Itertools;
+use rand::seq::IteratorRandom;
 
 #[derive(Clone, PartialEq)]
 struct Metadata {
@@ -228,16 +232,19 @@ fn send_loop(
     let mut sent: usize = 0;
     let mut count: u32 = 0;
     let mut start = Instant::now();
-    loop {
+    let hosts = ips.hosts().chunks(fill_amt);
+    for ip_chunk in &hosts {
         count += 1;
-        let ip_chunk: Vec<Ipv4Addr> = ips.hosts().take(fill_amt).collect();
+        // let ip_chunk: Vec<Ipv4Addr> = hosts.next();
+        let ip_chunk: Vec<Ipv4Addr> = ip_chunk.collect();
         let chunk_len = ip_chunk.len();
+        println!("{}", chunk_len);
         if chunk_len == 0 {
             break;
         }
         if send_mul != 0 && count.rem_euclid(1000) == 0 {
             print!(
-                "pps {}   \r", 
+                "pps {}   \r",
                 sent * send_mul as usize * 1000 / start.elapsed().as_millis() as usize
             );
             std::io::stdout().flush().unwrap();
@@ -435,9 +442,8 @@ async fn main() {
                         .unwrap();
                         let elapsed = start.elapsed().as_millis();
                         std::thread::sleep(Duration::from_secs(2));
-                        println!("meowtime {:.2}", packets * 1000 / elapsed);
+                        println!("final pps {:.2}", packets * 1000 / elapsed);
                         std::process::exit(0);
-                        return;
                     });
                 } else {
                     let ((tx_q, _rx_q, fq_cq), umem, mut descs) =
