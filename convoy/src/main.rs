@@ -1,6 +1,5 @@
 extern crate pnet;
 
-use default_net::{Interface, interface};
 use pnet::datalink::{NetworkInterface, interfaces};
 use pnet::packet::{
     MutablePacket, Packet,
@@ -13,7 +12,6 @@ use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
 use ipnet::Ipv4Net;
-use tokio::task::JoinSet;
 use xsk_rs::config::{QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
@@ -21,12 +19,45 @@ use std::env;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_scoped::TokioScope;
+#[derive(Clone, PartialEq)]
+struct Metadata {
+    ip: u32,
+    port: u16,
+}
 
-fn handle_recv(packet: &[u8], range: &Ipv4Net) {
+struct Dedupe<T, const N: usize> {
+    buffer: [Option<T>; N],
+    cursor: usize,
+}
+
+impl<T: PartialEq + Clone, const N: usize> Dedupe<T, N> {
+    fn new() -> Self {
+        Self {
+            buffer: std::array::from_fn(|_| None),
+            cursor: 0,
+        }
+    }
+
+    fn check(&mut self, item: T) -> bool {
+        for slot in self.buffer.iter() {
+            if let Some(existing) = slot {
+                if existing == &item {
+                    return true;
+                }
+            }
+        }
+
+        self.buffer[self.cursor] = Some(item);
+
+        self.cursor = (self.cursor + 1) % N;
+
+        false
+    }
+}
+
+fn handle_recv(packet: &[u8], range: &Ipv4Net, dedupe: &mut Dedupe<Metadata, 4096>) {
     let eth = EthernetPacket::new(packet).unwrap();
     let packet_vec = eth.payload().to_vec();
     let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
@@ -36,14 +67,21 @@ fn handle_recv(packet: &[u8], range: &Ipv4Net) {
         match ip_packet.get_next_level_protocol() {
             IpNextHeaderProtocols::Tcp => {
                 let tcp_packet: TcpPacket = TcpPacket::new(ip_packet.payload()).unwrap();
-                println!(
-                    "Tcp {0}:{1} -> {2}:{3} - {4}",
-                    ip_packet.get_source(),
-                    tcp_packet.get_source().to_string(),
-                    ip_packet.get_destination().to_string(),
-                    tcp_packet.get_destination().to_string(),
-                    tcp_packet.get_flags().to_string(),
-                );
+                let meta = Metadata {
+                    ip: ip_packet.get_source().to_bits(),
+                    port: tcp_packet.get_source(),
+                };
+                let dupe = dedupe.check(meta);
+                if !dupe {
+                    println!(
+                        "Tcp {0}:{1} -> {2}:{3} - {4}",
+                        ip_packet.get_source(),
+                        tcp_packet.get_source().to_string(),
+                        ip_packet.get_destination().to_string(),
+                        tcp_packet.get_destination().to_string(),
+                        tcp_packet.get_flags().to_string(),
+                    );
+                }
             }
             _ => {}
         }
@@ -57,13 +95,14 @@ fn recv(
     umem: &Umem,
     range: &Ipv4Net,
 ) {
+    let mut dedupe: Dedupe<Metadata, 4096> = Dedupe::new();
     loop {
         unsafe {
             fq.produce(descs);
             let packets = rx_q.poll_and_consume(descs, 100).unwrap();
             for packet in descs.iter().take(packets) {
                 let data = umem.data(packet);
-                handle_recv(data.contents(), range);
+                handle_recv(data.contents(), range, &mut dedupe);
             }
         }
     }
@@ -198,7 +237,7 @@ fn send_loop(
         }
         if send_mul != 0 && count.rem_euclid(1000) == 0 {
             print!(
-                "pps {}   \r",
+                "pps {}   \r", 
                 sent * send_mul as usize * 1000 / start.elapsed().as_millis() as usize
             );
             std::io::stdout().flush().unwrap();
@@ -342,7 +381,7 @@ async fn main() {
     } else {
         ports.push(scan_range_1);
     }
-    let tx_amt: u32 = 4;
+    let tx_amt: u32 = 1;
     let ips = calculate_ips(range);
     let packets: u128 = ports.len() as u128 * 2u128.pow(32 - ips.prefix_len() as u32) as u128;
     println!("Sending: {}", packets);
@@ -397,6 +436,7 @@ async fn main() {
                         let elapsed = start.elapsed().as_millis();
                         std::thread::sleep(Duration::from_secs(2));
                         println!("meowtime {:.2}", packets * 1000 / elapsed);
+                        std::process::exit(0);
                         return;
                     });
                 } else {
