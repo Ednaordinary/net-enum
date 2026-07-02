@@ -17,6 +17,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Install deps
       run: sudo apt update && sudo apt install -y libelf-dev tcpdump libpcap-dev
     - name: Build -> Test -> Release
@@ -26,8 +28,8 @@ jobs:
         cd convoy
         cargo build -r --verbose
         cargo test --verbose
-        git fetch --tags origin
-        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.1")
+        git fetch --tags origin --force
+        LATEST_TAG=$(git tag --sort=-v:refname | head -n 1)
         VERSION=${LATEST_TAG#v}
         BASE_VERSION=$(echo "$VERSION" | cut -d. -f1-2)
         PATCH_VERSION=$(echo "$VERSION" | cut -d. -f3)
