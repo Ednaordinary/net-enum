@@ -1,4 +1,4 @@
-name: Rust
+name: Release Convoy
 
 on:
   push:
@@ -20,13 +20,13 @@ jobs:
     - name: Install deps
       run: sudo apt update && sudo apt install -y libelf-dev
     - name: Build
-      run: cargo build -r --verbose
+      run: cd convoy && cargo build -r --verbose
     - name: Run tests
       run: cargo test --verbose
     - name: Release
       env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: cd convoy && gh release create ${{ github.ref_name }} \
+      run: gh release create ${{ github.ref_name }} \
             target/release/convoy \
             --title "Convoy release ${{ github.ref_name }}" \
             --generate-notes
