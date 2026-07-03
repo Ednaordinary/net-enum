@@ -1,6 +1,6 @@
 [package]
 name = "convoy"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 
 [dependencies]
@@ -17,3 +17,4 @@ itertools = "0.15.0"
 clap = { version = "4.6.1", features = ["derive"] }
 aya = "0.14.0"
 anyhow = "1.0.103"
+aya-log = "0.3.0"

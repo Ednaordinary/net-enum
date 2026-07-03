@@ -1,7 +1,6 @@
 extern crate pnet;
 
 use aya::maps::{MapData, MapError};
-use aya::{BpfError, EbpfError};
 use ipnet::Ipv4Net;
 use pnet::datalink::{NetworkInterface, interfaces};
 use pnet::packet::{
@@ -27,15 +26,17 @@ use std::time::{Duration, Instant};
 
 use aya::{
     Ebpf, include_bytes_aligned,
-    maps::XskMap,
+    maps::{Array, XskMap},
     programs::{Xdp, XdpMode},
 };
+use aya_log::EbpfLogger;
 
 use anyhow::Result;
 use clap::Parser;
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
 
+//
 /// A speedy af_xdp port scanner
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -95,6 +96,19 @@ impl<T: PartialEq + Clone, const N: usize> Dedupe<T, N> {
 
         false
     }
+}
+
+fn toggle_capture_port(
+    ebpf: &mut Ebpf,
+    port: u16,
+    enabled: bool,
+) -> Result<(), aya::maps::MapError> {
+    let mut bitmap = Array::try_from(ebpf.map_mut("CAPTURE_PORTS_BITMAP").unwrap())?;
+
+    let value: u8 = if enabled { 1 } else { 0 };
+    bitmap.set(port as u32, value, 0)?;
+
+    Ok(())
 }
 
 fn handle_recv(packet: &[u8], range: &Ipv4Net, dedupe: &mut Dedupe<Metadata, 4096>) {
@@ -296,13 +310,15 @@ fn send_loop(
             eth_packet,
         );
         unsafe {
-            //while !tx_q.poll(100).unwrap() {
-            //    println!("poll failed");
-            //}
-            while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() } < 1 {}
+            while !tx_q.poll(100).unwrap() {
+                println!("poll failed");
+                tx_q.wakeup().unwrap();
+                sent += cq.consume(&mut descs[..]);
+            }
+            while { tx_q.produce(&mut descs[..chunk_len]) } < 1 {}
             fill_amt = 0;
             while fill_amt == 0 {
-                fill_amt = cq.consume(&mut descs[..])
+                fill_amt = cq.consume(&mut descs[..]);
             }
             sent += fill_amt;
         }
@@ -381,7 +397,10 @@ fn inject_ebpf(interface: &str) -> Ebpf {
     .unwrap();
     let program: &mut Xdp = bpf.program_mut("xsk_def_prog").unwrap().try_into().unwrap();
     program.load().unwrap();
-    program.attach(interface, XdpMode::Default).unwrap();
+    program.attach(interface, XdpMode::Skb).unwrap();
+    if let Err(e) = EbpfLogger::init(&mut bpf) {
+        eprintln!("Failed to initialize eBPF logger: {}", e);
+    }
     bpf
 }
 
@@ -397,8 +416,8 @@ fn make_socket(
 ) {
     let (umem, descs) = Umem::new(
         UmemConfig::builder()
-            .comp_queue_size(QueueSize::new(1024).unwrap())
-            .fill_queue_size(QueueSize::new(1024).unwrap())
+            .comp_queue_size(QueueSize::new(2u32.pow(16)).unwrap())
+            .fill_queue_size(QueueSize::new(2u32.pow(16)).unwrap())
             //.frame_size(FrameSize::new(2048).unwrap())
             .build()
             .unwrap(),
@@ -409,9 +428,8 @@ fn make_socket(
     let socket = unsafe {
         Socket::new(
             SocketConfig::builder()
-                .tx_queue_size(QueueSize::new(1024).unwrap())
+                .tx_queue_size(QueueSize::new(2u32.pow(16)).unwrap())
                 .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
-                .xdp_flags(XdpFlags::XDP_FLAGS_SKB_MODE)
                 .build(),
             &umem,
             &interface.name.parse().unwrap(),
@@ -425,8 +443,15 @@ fn make_socket(
     (socket, umem, descs)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let args = Args::parse();
     let range = args.range;
     let mut ports: Vec<u16> = Vec::new();
@@ -456,7 +481,6 @@ async fn main() {
             .mac_addr
             .octets(),
     );
-    let ip_len = 2u128.pow(32 - ips.prefix_len() as u32);
     let chunk_prefix = std::cmp::min(32, ips.prefix_len() + args.tx.ilog2() as u8);
     let chunk_amt = 2_i32.pow((chunk_prefix - ips.prefix_len()) as u32);
     let ip_chunks = ips.subnets(chunk_prefix).unwrap();
@@ -465,10 +489,13 @@ async fn main() {
     let mut q_id: u32 = 0;
     let start = Instant::now();
     let mut ebpf = inject_ebpf(&interface.name);
+    ports
+        .iter()
+        .for_each(|x| toggle_capture_port(&mut ebpf, *x, true).unwrap());
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
-            for (idx, ip_chunk) in ip_chunks.enumerate() {
+            for ip_chunk in ip_chunks {
                 if q_id == (chunk_amt - 1) as u32 {
                     let ((tx_q, rx_q, fq_cq), umem, mut descs) =
                         make_socket(&interface, 2048, q_id, &mut ebpf);
@@ -499,7 +526,7 @@ async fn main() {
                         .unwrap();
                         let elapsed = start.elapsed().as_millis();
                         std::thread::sleep(Duration::from_secs(2));
-                        println!("final pps {:.2}", packets * 1000 / elapsed);
+                        println!("Final pps {:.2}", packets * 1000 / elapsed);
                         std::process::exit(0);
                     });
                 } else {
