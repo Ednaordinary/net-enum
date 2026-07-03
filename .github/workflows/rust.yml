@@ -25,6 +25,9 @@ jobs:
       env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        cd convoy-ebpf
+        cargo build -r --verbose
+        cd ..
         cd convoy
         cargo build -r --verbose
         cargo test --verbose
