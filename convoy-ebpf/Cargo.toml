@@ -1,0 +1,21 @@
+[package]
+name = "convoy-ebpf"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "convoy-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+aya-log-ebpf = "0.2.0"
+
+[build-dependencies]
+which = "8.0.4"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

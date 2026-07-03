@@ -1,5 +1,7 @@
 extern crate pnet;
 
+use aya::maps::{MapData, MapError};
+use aya::{BpfError, EbpfError};
 use ipnet::Ipv4Net;
 use pnet::datalink::{NetworkInterface, interfaces};
 use pnet::packet::{
@@ -12,16 +14,24 @@ use pnet::packet::{
 use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
-use xsk_rs::config::{QueueSize, SocketConfig, UmemConfig, XdpFlags};
+use xsk_rs::config::{LibxdpFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
 use std::env;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::fd::AsRawFd;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aya::{
+    Ebpf, include_bytes_aligned,
+    maps::XskMap,
+    programs::{Xdp, XdpMode},
+};
+
+use anyhow::Result;
 use clap::Parser;
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
@@ -45,6 +55,10 @@ struct Args {
     /// Port range end
     #[arg(short, default_value_t = 0)]
     e: u16,
+
+    /// Interface to use
+    #[arg(short, long, default_value = "")]
+    net: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -360,10 +374,22 @@ fn calculate_ips(range: String) -> Ipv4Net {
     ips
 }
 
+fn inject_ebpf(interface: &str) -> Ebpf {
+    let mut bpf = Ebpf::load(include_bytes_aligned!(
+        "../../convoy-ebpf/target/bpfel-unknown-none/release/convoy-ebpf"
+    ))
+    .unwrap();
+    let program: &mut Xdp = bpf.program_mut("xsk_def_prog").unwrap().try_into().unwrap();
+    program.load().unwrap();
+    program.attach(interface, XdpMode::Skb).unwrap();
+    bpf
+}
+
 fn make_socket(
     interface: &NetworkInterface,
     buffer: u32,
     q_id: u32,
+    //ebpf: &mut Ebpf,
 ) -> (
     (TxQueue, RxQueue, Option<(FillQueue, CompQueue)>),
     Umem,
@@ -384,6 +410,7 @@ fn make_socket(
         Socket::new(
             SocketConfig::builder()
                 .tx_queue_size(QueueSize::new(1024).unwrap())
+                // .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
                 .xdp_flags(XdpFlags::XDP_FLAGS_SKB_MODE)
                 .build(),
             &umem,
@@ -392,6 +419,8 @@ fn make_socket(
         )
     }
     .unwrap();
+    //let mut xsks_map = XskMap::try_from(ebpf.map_mut("xsks_map").unwrap()).unwrap();
+    //xsks_map.set(q_id, socket.0.fd().as_raw_fd(), 0).unwrap();
     (socket, umem, descs)
 }
 
@@ -401,36 +430,47 @@ async fn main() {
     let range = args.range;
     let mut ports: Vec<u16> = Vec::new();
     if args.e != 0 {
+        println!("Scanning ports {}..{}", args.b, args.e);
         (args.b..args.e).for_each(|x| ports.push(x));
     } else {
+        println!("Scanning port {}", args.b);
         ports.push(args.b);
     }
-    let tx_amt: u32 = args.tx as u32;
     let ips = calculate_ips(range);
     let packets: u128 = ports.len() as u128 * 2u128.pow(32 - ips.prefix_len() as u32) as u128;
     println!("Sending: {}", packets);
     println!("Total size (bytes): {}", packets * 54);
     let ifs = interfaces();
-    let if_default = default_net::get_default_interface().unwrap();
-    let interface = ifs.into_iter().find(|x| x.name == if_default.name).unwrap();
-    let gate = default_net::get_default_gateway().unwrap();
+    let if_default: String;
+    if args.net != "" {
+        if_default = args.net;
+    } else {
+        if_default = default_net::get_default_interface().unwrap().name;
+    }
+    let interface = ifs.into_iter().find(|x| x.name == if_default).unwrap();
     let mac: MacAddr = interface.mac.unwrap();
-    let gate_mac: MacAddr = MacAddr::from(gate.mac_addr.octets());
+    let gate_mac: MacAddr = MacAddr::from(
+        default_net::get_default_gateway()
+            .unwrap()
+            .mac_addr
+            .octets(),
+    );
     let ip_len = 2u128.pow(32 - ips.prefix_len() as u32);
-    let chunk_prefix = std::cmp::min(32, ips.prefix_len() + tx_amt.ilog2() as u8);
+    let chunk_prefix = std::cmp::min(32, ips.prefix_len() + args.tx.ilog2() as u8);
     let chunk_amt = 2_i32.pow((chunk_prefix - ips.prefix_len()) as u32);
     let ip_chunks = ips.subnets(chunk_prefix).unwrap();
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
     let mut q_id: u32 = 0;
     let start = Instant::now();
+    // let mut ebpf = inject_ebpf(&interface.name);
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
             for (idx, ip_chunk) in ip_chunks.enumerate() {
                 if q_id == (chunk_amt - 1) as u32 {
                     let ((tx_q, rx_q, fq_cq), umem, mut descs) =
-                        make_socket(&interface, 2048, q_id);
+                        make_socket(&interface, 2048, q_id); //, &mut ebpf);
                     let desc_len = descs.len();
                     let (mut rx_desc, mut tx_desc) = descs.split_at_mut(desc_len / 2);
                     let (fq, mut cq) = fq_cq.unwrap();
@@ -453,7 +493,7 @@ async fn main() {
                             tx_q,
                             &mut cq,
                             &mut tx_desc,
-                            tx_amt as u32,
+                            args.tx as u32,
                         )
                         .unwrap();
                         let elapsed = start.elapsed().as_millis();
@@ -463,7 +503,7 @@ async fn main() {
                     });
                 } else {
                     let ((tx_q, _rx_q, fq_cq), umem, mut descs) =
-                        make_socket(&interface, 1024, q_id);
+                        make_socket(&interface, 1024, q_id); //, &mut ebpf);
                     let (_fq, mut cq) = fq_cq.unwrap();
                     let ip_ref = ip_chunk;
                     let ports_clone = ports.clone();
