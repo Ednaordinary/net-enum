@@ -1112,8 +1112,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xsk-rs"
-version = "0.8.1"
-source = "git+https://github.com/rstade/xsk-rs/?branch=rstade#af35b2a53911b62bcb6dba1e8c24657e91e93afc"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1fef46e3505c5055082f52ada0a7f8e5dcaebdbb9eccf8e978c32382c159270"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",

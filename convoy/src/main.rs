@@ -381,7 +381,7 @@ fn inject_ebpf(interface: &str) -> Ebpf {
     .unwrap();
     let program: &mut Xdp = bpf.program_mut("xsk_def_prog").unwrap().try_into().unwrap();
     program.load().unwrap();
-    program.attach(interface, XdpMode::Skb).unwrap();
+    program.attach(interface, XdpMode::Default).unwrap();
     bpf
 }
 
@@ -389,7 +389,7 @@ fn make_socket(
     interface: &NetworkInterface,
     buffer: u32,
     q_id: u32,
-    //ebpf: &mut Ebpf,
+    ebpf: &mut Ebpf,
 ) -> (
     (TxQueue, RxQueue, Option<(FillQueue, CompQueue)>),
     Umem,
@@ -410,7 +410,7 @@ fn make_socket(
         Socket::new(
             SocketConfig::builder()
                 .tx_queue_size(QueueSize::new(1024).unwrap())
-                // .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
+                .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
                 .xdp_flags(XdpFlags::XDP_FLAGS_SKB_MODE)
                 .build(),
             &umem,
@@ -419,8 +419,9 @@ fn make_socket(
         )
     }
     .unwrap();
-    //let mut xsks_map = XskMap::try_from(ebpf.map_mut("xsks_map").unwrap()).unwrap();
-    //xsks_map.set(q_id, socket.0.fd().as_raw_fd(), 0).unwrap();
+    let xsks_map_obj = ebpf.map_mut("XSKS_MAP").unwrap();
+    let mut xsks_map = XskMap::try_from(xsks_map_obj).unwrap();
+    xsks_map.set(q_id, socket.0.fd().as_raw_fd(), 0).unwrap();
     (socket, umem, descs)
 }
 
@@ -463,14 +464,14 @@ async fn main() {
     println!("if: {}", interface.name);
     let mut q_id: u32 = 0;
     let start = Instant::now();
-    // let mut ebpf = inject_ebpf(&interface.name);
+    let mut ebpf = inject_ebpf(&interface.name);
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
             for (idx, ip_chunk) in ip_chunks.enumerate() {
                 if q_id == (chunk_amt - 1) as u32 {
                     let ((tx_q, rx_q, fq_cq), umem, mut descs) =
-                        make_socket(&interface, 2048, q_id); //, &mut ebpf);
+                        make_socket(&interface, 2048, q_id, &mut ebpf);
                     let desc_len = descs.len();
                     let (mut rx_desc, mut tx_desc) = descs.split_at_mut(desc_len / 2);
                     let (fq, mut cq) = fq_cq.unwrap();
@@ -503,7 +504,7 @@ async fn main() {
                     });
                 } else {
                     let ((tx_q, _rx_q, fq_cq), umem, mut descs) =
-                        make_socket(&interface, 1024, q_id); //, &mut ebpf);
+                        make_socket(&interface, 1024, q_id, &mut ebpf);
                     let (_fq, mut cq) = fq_cq.unwrap();
                     let ip_ref = ip_chunk;
                     let ports_clone = ports.clone();
