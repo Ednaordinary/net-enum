@@ -3,6 +3,7 @@ extern crate pnet;
 use aya::maps::{MapData, MapError};
 use ipnet::Ipv4Net;
 use pnet::datalink::{NetworkInterface, interfaces};
+use pnet::packet::tcp::TcpOption;
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
@@ -13,10 +14,11 @@ use pnet::packet::{
 use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
-use xsk_rs::config::{LibxdpFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
+use xsk_rs::config::{FrameSize, LibxdpFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
 use std::env;
+use std::fmt::Debug;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
@@ -60,6 +62,14 @@ struct Args {
     /// Interface to use
     #[arg(short, long, default_value = "")]
     net: String,
+
+    /// Umem buffer size exponent
+    #[arg(short, default_value_t = 7, value_parser = clap::value_parser!(u8).range(7..))]
+    u: u8,
+
+    /// Queue size exponent
+    #[arg(short, default_value_t = 20)]
+    q: u8,
 }
 
 #[derive(Clone, PartialEq)]
@@ -243,9 +253,10 @@ fn write_tcp_packet(packet: &[u8], umem: &Umem, desc: &mut FrameDesc) {
     unsafe {
         let mut mut_frame = umem.data_mut(desc);
         let mut cursor = mut_frame.cursor();
+        cursor.set_pos(0);
         let write_res = cursor.write_all(packet).err();
         if write_res.is_some() {
-            println!("Failed to write full frame buffer");
+            println!("{:?} Frame len: {:?}", write_res, desc.lengths());
         }
     }
 }
@@ -258,13 +269,13 @@ fn fill_descs(
     ipv4_packet: &[u8],
     eth_packet: &[u8],
 ) {
-    for (desc, ip) in descs.iter_mut().zip(ips) {
+    descs.iter_mut().zip(ips).for_each(|(desc, ip)| {
         let mut vec_packet = ipv4_packet.to_vec();
         let packet = MutableIpv4Packet::new(&mut vec_packet).unwrap();
         craft_tcp_packet_inplace(packet, ip, partial_sum);
         vec_packet = [eth_packet, &vec_packet].concat().to_vec();
         write_tcp_packet(&mut vec_packet, &umem, desc);
-    }
+    });
 }
 
 fn send_loop(
@@ -279,8 +290,9 @@ fn send_loop(
     mut fill_amt: usize,
     send_mul: u32,
 ) -> usize {
-    let mut sent: usize = 0;
+    let mut sent: u32 = 0;
     let mut count: u32 = 0;
+    let mut elapsed: f64;
     let mut start = Instant::now();
     let hosts = ips.hosts().chunks(fill_amt);
     for ip_chunk in &hosts {
@@ -291,15 +303,15 @@ fn send_loop(
         if chunk_len == 0 {
             break;
         }
-        if send_mul != 0 && count.rem_euclid(1000) == 0 {
-            print!(
-                "pps {}   \r",
-                sent * send_mul as usize * 1000 / start.elapsed().as_millis() as usize
-            );
-            std::io::stdout().flush().unwrap();
-            count = 0;
-            sent = 0;
-            start = Instant::now();
+        if send_mul != 0 {
+            elapsed = start.elapsed().as_secs_f64();
+            if elapsed >= 0.2 {
+                print!("pps {:.2}      \r", (sent * send_mul) as f64 / elapsed);
+                std::io::stdout().flush().unwrap();
+                count = 0;
+                sent = 0;
+                start = Instant::now();
+            }
         }
         fill_descs(
             &mut descs[..chunk_len],
@@ -310,21 +322,30 @@ fn send_loop(
             eth_packet,
         );
         unsafe {
-            while !tx_q.poll(100).unwrap() {
-                println!("poll failed");
-                tx_q.wakeup().unwrap();
-                sent += cq.consume(&mut descs[..]);
+            //let mut comp_buf = [std::mem::zeroed::<FrameDesc>(); 64];
+            // while !tx_q.poll(0).unwrap() {
+            //     //println!("poll failed");
+            //     if tx_q.needs_wakeup() {
+            //         tx_q.wakeup().unwrap();
+            //     }
+            //     tx_q.wakeup().unwrap();
+            //     sent += cq.consume(&mut comp_buf[..]) as u32;
+            // }
+            while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() < 1 } {}
+            //fill_amt = 0;
+            //while fill_amt == 0 {
+            fill_amt = cq.consume(&mut descs[..]);
+            //}
+            if fill_amt > 0 {
+                //descs[..fill_amt].copy_from_slice(&comp_buf[..fill_amt]);
+                sent += fill_amt as u32;
+            } else {
+                fill_amt = chunk_len;
             }
-            while { tx_q.produce(&mut descs[..chunk_len]) } < 1 {}
-            fill_amt = 0;
-            while fill_amt == 0 {
-                fill_amt = cq.consume(&mut descs[..]);
-            }
-            sent += fill_amt;
         }
     }
     if send_mul != 0 {
-        print!("\r          \r");
+        print!("\r             \r");
     }
     fill_amt
 }
@@ -360,6 +381,16 @@ fn send_packets(
         base_packet.set_data_offset(5);
         base_packet.set_reserved(0);
         base_packet.set_urgent_ptr(0);
+        // if you wanna slopify your packets for some reason
+        // let mut opts = vec![
+        //     TcpOption::mss(1460),
+        //     TcpOption::nop(),
+        //     TcpOption::wscale(7),
+        //     TcpOption::sack_perm(),
+        //     TcpOption::timestamp(12345678, 0),
+        // ];
+        // opts.extend(std::iter::repeat(TcpOption::nop()).take(16));
+        // base_packet.set_options(&opts);
     }
     //let mut packet = MutableIpv4Packet::from(ip_packet);
     let mut fill_amt = descs.len();
@@ -397,7 +428,7 @@ fn inject_ebpf(interface: &str) -> Ebpf {
     .unwrap();
     let program: &mut Xdp = bpf.program_mut("xsk_def_prog").unwrap().try_into().unwrap();
     program.load().unwrap();
-    program.attach(interface, XdpMode::Skb).unwrap();
+    program.attach(interface, XdpMode::Driver).unwrap();
     if let Err(e) = EbpfLogger::init(&mut bpf) {
         eprintln!("Failed to initialize eBPF logger: {}", e);
     }
@@ -406,7 +437,9 @@ fn inject_ebpf(interface: &str) -> Ebpf {
 
 fn make_socket(
     interface: &NetworkInterface,
-    buffer: u32,
+    umem_size: u32,
+    in_queue_size: u32,
+    out_queue_size: u32,
     q_id: u32,
     ebpf: &mut Ebpf,
 ) -> (
@@ -416,19 +449,19 @@ fn make_socket(
 ) {
     let (umem, descs) = Umem::new(
         UmemConfig::builder()
-            .comp_queue_size(QueueSize::new(2u32.pow(16)).unwrap())
-            .fill_queue_size(QueueSize::new(2u32.pow(16)).unwrap())
-            //.frame_size(FrameSize::new(2048).unwrap())
+            .comp_queue_size(QueueSize::new(in_queue_size).unwrap())
+            .fill_queue_size(QueueSize::new(in_queue_size).unwrap())
+            .frame_size(FrameSize::new(2048).unwrap())
             .build()
             .unwrap(),
-        buffer.try_into().unwrap(),
+        umem_size.try_into().unwrap(),
         false,
     )
     .unwrap();
     let socket = unsafe {
         Socket::new(
             SocketConfig::builder()
-                .tx_queue_size(QueueSize::new(2u32.pow(16)).unwrap())
+                .tx_queue_size(QueueSize::new(out_queue_size).unwrap())
                 .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
                 .build(),
             &umem,
@@ -487,7 +520,6 @@ async fn async_main() {
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
     let mut q_id: u32 = 0;
-    let start = Instant::now();
     let mut ebpf = inject_ebpf(&interface.name);
     ports
         .iter()
@@ -497,8 +529,14 @@ async fn async_main() {
             println!("{}", v4_addr);
             for ip_chunk in ip_chunks {
                 if q_id == (chunk_amt - 1) as u32 {
-                    let ((tx_q, rx_q, fq_cq), umem, mut descs) =
-                        make_socket(&interface, 2048, q_id, &mut ebpf);
+                    let ((tx_q, rx_q, fq_cq), umem, mut descs) = make_socket(
+                        &interface,
+                        2u32.pow(args.u as u32),
+                        2u32.pow(args.q as u32),
+                        2u32.pow(args.q as u32),
+                        q_id,
+                        &mut ebpf,
+                    );
                     let desc_len = descs.len();
                     let (mut rx_desc, mut tx_desc) = descs.split_at_mut(desc_len / 2);
                     let (fq, mut cq) = fq_cq.unwrap();
@@ -510,6 +548,7 @@ async fn async_main() {
                         });
                         let ip_ref = ip_chunk;
                         let ports_clone = ports.clone();
+                        let start = Instant::now();
                         send_packets(
                             &v4_addr,
                             &ip_ref,
@@ -530,8 +569,14 @@ async fn async_main() {
                         std::process::exit(0);
                     });
                 } else {
-                    let ((tx_q, _rx_q, fq_cq), umem, mut descs) =
-                        make_socket(&interface, 1024, q_id, &mut ebpf);
+                    let ((tx_q, _rx_q, fq_cq), umem, mut descs) = make_socket(
+                        &interface,
+                        2u32.pow(args.u as u32),
+                        2u32.pow(args.q as u32),
+                        2u32.pow(args.q as u32),
+                        q_id,
+                        &mut ebpf,
+                    );
                     let (_fq, mut cq) = fq_cq.unwrap();
                     let ip_ref = ip_chunk;
                     let ports_clone = ports.clone();
