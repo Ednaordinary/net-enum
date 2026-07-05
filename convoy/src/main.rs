@@ -2,6 +2,7 @@ extern crate pnet;
 
 use aya::maps::{MapData, MapError};
 use ipnet::Ipv4Net;
+use iprange::IpRange;
 use pnet::datalink::{NetworkInterface, interfaces};
 use pnet::packet::tcp::TcpOption;
 use pnet::packet::{
@@ -38,6 +39,10 @@ use clap::Parser;
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
 
+mod lib;
+
+use lib::read_exclude;
+
 //
 /// A speedy af_xdp port scanner
 #[derive(Parser, Debug)]
@@ -70,6 +75,10 @@ struct Args {
     /// Queue size exponent
     #[arg(short, default_value_t = 20)]
     q: u8,
+
+    /// Exclude list
+    #[arg(long, default_value = "")]
+    exclude: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -264,7 +273,7 @@ fn write_tcp_packet(packet: &[u8], umem: &Umem, desc: &mut FrameDesc) {
 fn fill_descs(
     descs: &mut [FrameDesc],
     umem: &Umem,
-    ips: Vec<Ipv4Addr>,
+    ips: &Vec<Ipv4Addr>,
     partial_sum: u32,
     ipv4_packet: &[u8],
     eth_packet: &[u8],
@@ -272,87 +281,15 @@ fn fill_descs(
     descs.iter_mut().zip(ips).for_each(|(desc, ip)| {
         let mut vec_packet = ipv4_packet.to_vec();
         let packet = MutableIpv4Packet::new(&mut vec_packet).unwrap();
-        craft_tcp_packet_inplace(packet, ip, partial_sum);
+        craft_tcp_packet_inplace(packet, *ip, partial_sum);
         vec_packet = [eth_packet, &vec_packet].concat().to_vec();
         write_tcp_packet(&mut vec_packet, &umem, desc);
     });
 }
 
-fn send_loop(
-    descs: &mut [FrameDesc],
-    umem: &Umem,
-    ips: &Ipv4Net,
-    partial_sum: u32,
-    ipv4_packet: &MutableIpv4Packet,
-    eth_packet: &[u8],
-    tx_q: &mut TxQueue,
-    cq: &mut CompQueue,
-    mut fill_amt: usize,
-    send_mul: u32,
-) -> usize {
-    let mut sent: u32 = 0;
-    let mut count: u32 = 0;
-    let mut elapsed: f64;
-    let mut start = Instant::now();
-    let hosts = ips.hosts().chunks(fill_amt);
-    for ip_chunk in &hosts {
-        count += 1;
-        // let ip_chunk: Vec<Ipv4Addr> = hosts.next();
-        let ip_chunk: Vec<Ipv4Addr> = ip_chunk.collect();
-        let chunk_len = ip_chunk.len();
-        if chunk_len == 0 {
-            break;
-        }
-        if send_mul != 0 {
-            elapsed = start.elapsed().as_secs_f64();
-            if elapsed >= 0.2 {
-                print!("pps {:.2}      \r", (sent * send_mul) as f64 / elapsed);
-                std::io::stdout().flush().unwrap();
-                count = 0;
-                sent = 0;
-                start = Instant::now();
-            }
-        }
-        fill_descs(
-            &mut descs[..chunk_len],
-            umem,
-            ip_chunk,
-            partial_sum,
-            ipv4_packet.packet(),
-            eth_packet,
-        );
-        unsafe {
-            //let mut comp_buf = [std::mem::zeroed::<FrameDesc>(); 64];
-            // while !tx_q.poll(0).unwrap() {
-            //     //println!("poll failed");
-            //     if tx_q.needs_wakeup() {
-            //         tx_q.wakeup().unwrap();
-            //     }
-            //     tx_q.wakeup().unwrap();
-            //     sent += cq.consume(&mut comp_buf[..]) as u32;
-            // }
-            while { tx_q.produce_and_wakeup(&mut descs[..chunk_len]).unwrap() < 1 } {}
-            //fill_amt = 0;
-            //while fill_amt == 0 {
-            fill_amt = cq.consume(&mut descs[..]);
-            //}
-            if fill_amt > 0 {
-                //descs[..fill_amt].copy_from_slice(&comp_buf[..fill_amt]);
-                sent += fill_amt as u32;
-            } else {
-                fill_amt = chunk_len;
-            }
-        }
-    }
-    if send_mul != 0 {
-        print!("\r             \r");
-    }
-    fill_amt
-}
-
 fn send_packets(
     source_ip: &Ipv4Addr,
-    remote_ips: &Ipv4Net,
+    remote_ips: &Vec<Ipv4Net>,
     source_port: u16,
     remote_ports: Vec<u16>,
     gate_mac: MacAddr,
@@ -362,7 +299,7 @@ fn send_packets(
     cq: &mut CompQueue,
     descs: &mut [FrameDesc],
     send_mul: u32,
-) -> Result<u128, Box<dyn std::error::Error>> {
+) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let mut part_sum = ipv4_word_sum(source_ip);
     let IpNextHeaderProtocol(protocol) = IpNextHeaderProtocols::Tcp;
     part_sum += protocol as u32;
@@ -393,27 +330,67 @@ fn send_packets(
         // base_packet.set_options(&opts);
     }
     //let mut packet = MutableIpv4Packet::from(ip_packet);
-    let mut fill_amt = descs.len();
+    let mut available = descs.len();
+    let mut sent: u64 = 0;
+    let mut consumed: usize;
     for port in remote_ports.iter() {
         println!("Port {}", port);
         {
             let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
             base_packet.set_destination(*port);
         }
-        fill_amt = send_loop(
-            descs,
-            &umem,
-            remote_ips,
-            part_sum,
-            &ip_packet,
-            &eth_buffer,
-            &mut tx_q,
-            cq,
-            fill_amt,
-            send_mul,
-        );
+        let mut hosts = remote_ips.into_iter().map(|x| x.hosts()).flatten();
+        unsafe {
+            loop {
+                while available == 0 {
+                    let consumed = cq.consume(&mut descs[..]);
+                    if consumed > 0 {
+                        sent += consumed as u64;
+                        available += consumed;
+                    } else if tx_q.needs_wakeup() {
+                        tx_q.wakeup().unwrap();
+                    }
+                }
+                let ip_chunk: Vec<Ipv4Addr> = hosts.by_ref().take(available).collect();
+                if ip_chunk.len() == 0 {
+                    break;
+                }
+                fill_descs(
+                    &mut descs[..ip_chunk.len()],
+                    umem,
+                    &ip_chunk,
+                    part_sum,
+                    &ip_packet.packet(),
+                    &eth_buffer,
+                );
+                let mut submit = 0;
+                while submit < ip_chunk.len() {
+                    let n = tx_q
+                        .produce_and_wakeup(&descs[submit..ip_chunk.len()])
+                        .unwrap();
+                    if n > 0 {
+                        submit += n;
+                        available -= n;
+                    } else {
+                        let consumed = cq.consume(&mut descs[..]);
+                        sent += consumed as u64;
+                        available += consumed;
+                    }
+                }
+                let consumed = cq.consume(&mut descs[..]);
+                sent += consumed as u64;
+                available += consumed;
+            }
+        }
     }
-    Ok(remote_ports.len() as u128 * 2u128.pow(remote_ips.prefix_len() as u32))
+    Ok((
+        sent,
+        remote_ports.len() as u64
+            * remote_ips
+                .iter()
+                .map(|x| 2u64.pow(32 - x.prefix_len() as u32))
+                .sum::<u64>(),
+    ))
 }
 
 fn calculate_ips(range: String) -> Ipv4Net {
@@ -489,23 +466,28 @@ async fn async_main() {
     let range = args.range;
     let mut ports: Vec<u16> = Vec::new();
     if args.e != 0 {
-        println!("Scanning ports {}..{}", args.b, args.e);
-        (args.b..args.e).for_each(|x| ports.push(x));
+        println!("Scanning ports {}..{}", args.b, args.e + 1);
+        (args.b..args.e + 1).for_each(|x| ports.push(x));
     } else {
         println!("Scanning port {}", args.b);
         ports.push(args.b);
     }
     let ips = calculate_ips(range);
-    let packets: u128 = ports.len() as u128 * 2u128.pow(32 - ips.prefix_len() as u32) as u128;
-    println!("Sending: {}", packets);
-    println!("Total size (bytes): {}", packets * 54);
-    let ifs = interfaces();
-    let if_default: String;
-    if args.net != "" {
-        if_default = args.net;
+    let excl: Vec<Ipv4Net> = if args.exclude != "" {
+        read_exclude(&args.exclude)
     } else {
-        if_default = default_net::get_default_interface().unwrap().name;
-    }
+        Vec::new()
+    };
+    // Below does not include exclude list, so it is an overshoot estimation
+    //let packets: u64 = ports.len() as u64 * 2u64.pow(32 - ips.prefix_len() as u32) as u64;
+    // println!("Sending: {}", packets);
+    // println!("Total size (bytes): {}", packets * 54);
+    let ifs = interfaces();
+    let if_default: String = if args.net != "" {
+        args.net
+    } else {
+        default_net::get_default_interface().unwrap().name
+    };
     let interface = ifs.into_iter().find(|x| x.name == if_default).unwrap();
     let mac: MacAddr = interface.mac.unwrap();
     let gate_mac: MacAddr = MacAddr::from(
@@ -517,6 +499,18 @@ async fn async_main() {
     let chunk_prefix = std::cmp::min(32, ips.prefix_len() + args.tx.ilog2() as u8);
     let chunk_amt = 2_i32.pow((chunk_prefix - ips.prefix_len()) as u32);
     let ip_chunks = ips.subnets(chunk_prefix).unwrap();
+    let ip_chunks: Vec<Vec<Ipv4Net>> = ip_chunks
+        .map(|x| {
+            let mut range: IpRange<Ipv4Net> = IpRange::new();
+            range.add(x);
+            excl.iter().for_each(|y| {
+                let mut yrange = IpRange::new();
+                yrange.add(*y);
+                range = range.exclude(&yrange);
+            });
+            range.into_iter().collect()
+        })
+        .collect();
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
     let mut q_id: u32 = 0;
@@ -549,7 +543,7 @@ async fn async_main() {
                         let ip_ref = ip_chunk;
                         let ports_clone = ports.clone();
                         let start = Instant::now();
-                        send_packets(
+                        let (packets, req) = send_packets(
                             &v4_addr,
                             &ip_ref,
                             34567,
@@ -563,9 +557,14 @@ async fn async_main() {
                             args.tx as u32,
                         )
                         .unwrap();
-                        let elapsed = start.elapsed().as_millis();
+                        let elapsed = start.elapsed().as_secs_f64();
                         std::thread::sleep(Duration::from_secs(2));
-                        println!("Final pps {:.2}", packets * 1000 / elapsed);
+                        println!("Packets requested: {}", req);
+                        println!("Packets sent: {}", packets);
+                        println!("Total real size (bytes): {}", packets * 54);
+                        println!("Elapsed: {:.2}", elapsed);
+                        // This is safe. packets will never exceed 2^48 so it fits in f64 mantissa
+                        println!("Final pps {:.2}", packets as f64 / elapsed);
                         std::process::exit(0);
                     });
                 } else {
