@@ -1,6 +1,6 @@
 [package]
 name = "convoy"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 
 [dependencies]
@@ -20,3 +20,11 @@ anyhow = "1.0.103"
 aya-log = "0.3.0"
 regex = "1.12.4"
 iprange = "0.6.7"
+
+[[bin]]
+name = "convoy"
+path = "src/main.rs"
+
+[[bin]]
+name = "con-reader"
+path = "src/reader.rs"

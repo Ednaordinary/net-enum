@@ -39,4 +39,4 @@ jobs:
         BASE_VERSION=$(echo "$VERSION" | cut -d. -f1-2)
         PATCH_VERSION=$(echo "$VERSION" | cut -d. -f3)
         NEXT_TAG="v${BASE_VERSION}.$((PATCH_VERSION + 1))"
-        gh release create "$NEXT_TAG" target/release/convoy --title "Convoy release "$NEXT_TAG" (x86)" --generate-notes
+        gh release create "$NEXT_TAG" target/release/convoy target/release/con-reader --title "Convoy release "$NEXT_TAG" (x86)" --generate-notes

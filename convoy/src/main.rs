@@ -41,7 +41,7 @@ use rand::seq::IteratorRandom;
 
 mod lib;
 
-use lib::read_exclude;
+use lib::*;
 
 //
 /// A speedy af_xdp port scanner
@@ -79,42 +79,14 @@ struct Args {
     /// Exclude list
     #[arg(long, default_value = "")]
     exclude: String,
-}
 
-#[derive(Clone, PartialEq)]
-struct Metadata {
-    ip: u32,
-    port: u16,
-}
+    /// Write to file
+    #[arg(short, long, default_value = "")]
+    file: String,
 
-struct Dedupe<T, const N: usize> {
-    buffer: [Option<T>; N],
-    cursor: usize,
-}
-
-impl<T: PartialEq + Clone, const N: usize> Dedupe<T, N> {
-    fn new() -> Self {
-        Self {
-            buffer: std::array::from_fn(|_| None),
-            cursor: 0,
-        }
-    }
-
-    fn check(&mut self, item: T) -> bool {
-        for slot in self.buffer.iter() {
-            if let Some(existing) = slot {
-                if existing == &item {
-                    return true;
-                }
-            }
-        }
-
-        self.buffer[self.cursor] = Some(item);
-
-        self.cursor = (self.cursor + 1) % N;
-
-        false
-    }
+    /// Do not print received packets;
+    #[arg(long)]
+    quiet: bool,
 }
 
 fn toggle_capture_port(
@@ -130,7 +102,13 @@ fn toggle_capture_port(
     Ok(())
 }
 
-fn handle_recv(packet: &[u8], range: &Ipv4Net, dedupe: &mut Dedupe<Metadata, 4096>) {
+fn handle_recv(
+    packet: &[u8],
+    range: &Ipv4Net,
+    dedupe: &mut Dedupe<Metadata, 4096>,
+    file: Option<&str>,
+    quiet: &bool,
+) {
     let eth = EthernetPacket::new(packet).unwrap();
     let packet_vec = eth.payload().to_vec();
     let ip_packet = Ipv4Packet::new(&packet_vec).unwrap();
@@ -144,16 +122,21 @@ fn handle_recv(packet: &[u8], range: &Ipv4Net, dedupe: &mut Dedupe<Metadata, 409
                     ip: ip_packet.get_source().to_bits(),
                     port: tcp_packet.get_source(),
                 };
-                let dupe = dedupe.check(meta);
+                let dupe = dedupe.check(&meta);
                 if !dupe {
-                    println!(
-                        "Tcp {0}:{1} -> {2}:{3} - {4}",
-                        ip_packet.get_source(),
-                        tcp_packet.get_source().to_string(),
-                        ip_packet.get_destination().to_string(),
-                        tcp_packet.get_destination().to_string(),
-                        tcp_packet.get_flags().to_string(),
-                    );
+                    if !*quiet {
+                        println!(
+                            "Tcp {0}:{1} -> {2}:{3} - {4}",
+                            ip_packet.get_source(),
+                            tcp_packet.get_source().to_string(),
+                            ip_packet.get_destination().to_string(),
+                            tcp_packet.get_destination().to_string(),
+                            tcp_packet.get_flags().to_string(),
+                        );
+                    }
+                    if file.is_some() {
+                        meta.file_append(file.unwrap())
+                    }
                 }
             }
             _ => {}
@@ -167,6 +150,8 @@ fn recv(
     descs: &mut [FrameDesc],
     umem: &Umem,
     range: &Ipv4Net,
+    file: Option<&str>,
+    quiet: bool,
 ) {
     let mut dedupe: Dedupe<Metadata, 4096> = Dedupe::new();
     loop {
@@ -175,7 +160,7 @@ fn recv(
             let packets = rx_q.poll_and_consume(descs, 100).unwrap();
             for packet in descs.iter().take(packets) {
                 let data = umem.data(packet);
-                handle_recv(data.contents(), range, &mut dedupe);
+                handle_recv(data.contents(), range, &mut dedupe, file, &quiet);
             }
         }
     }
@@ -329,12 +314,18 @@ fn send_packets(
         // opts.extend(std::iter::repeat(TcpOption::nop()).take(16));
         // base_packet.set_options(&opts);
     }
-    //let mut packet = MutableIpv4Packet::from(ip_packet);
+    let req = remote_ips
+        .iter()
+        .map(|x| 2u32.pow(32 - x.prefix_len() as u32))
+        .sum::<u32>();
     let mut available = descs.len();
-    let mut sent: u64 = 0;
+    let mut all_sent: u64 = 0;
     let mut consumed: usize;
+    let mut percent: u64;
+    let mut last_percent: u64 = 0;
     for port in remote_ports.iter() {
         println!("Port {}", port);
+        let mut sent: u32 = 0;
         {
             let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
             base_packet.set_destination(*port);
@@ -345,7 +336,7 @@ fn send_packets(
                 while available == 0 {
                     let consumed = cq.consume(&mut descs[..]);
                     if consumed > 0 {
-                        sent += consumed as u64;
+                        sent += consumed as u32;
                         available += consumed;
                     } else if tx_q.needs_wakeup() {
                         tx_q.wakeup().unwrap();
@@ -373,24 +364,35 @@ fn send_packets(
                         available -= n;
                     } else {
                         let consumed = cq.consume(&mut descs[..]);
-                        sent += consumed as u64;
+                        sent += consumed as u32;
                         available += consumed;
                     }
                 }
                 let consumed = cq.consume(&mut descs[..]);
-                sent += consumed as u64;
+                sent += consumed as u32;
                 available += consumed;
+                percent = sent as u64 * 100 / req as u64;
+                if percent != last_percent {
+                    print!("{}%      \r", sent * 100 / req);
+                    std::io::stdout().flush().unwrap();
+                }
+                last_percent = percent;
             }
         }
+        let total_descs = descs.len();
+        while available < total_descs {
+            let consumed = unsafe { cq.consume(&mut descs[..]) };
+            if consumed > 0 {
+                sent += consumed as u32;
+                available += consumed;
+            } else if tx_q.needs_wakeup() {
+                tx_q.wakeup().unwrap();
+            }
+        }
+        print!("\r          \r");
+        all_sent += sent as u64;
     }
-    Ok((
-        sent,
-        remote_ports.len() as u64
-            * remote_ips
-                .iter()
-                .map(|x| 2u64.pow(32 - x.prefix_len() as u32))
-                .sum::<u64>(),
-    ))
+    Ok((all_sent, remote_ports.len() as u64 * req as u64))
 }
 
 fn calculate_ips(range: String) -> Ipv4Net {
@@ -405,7 +407,7 @@ fn inject_ebpf(interface: &str) -> Ebpf {
     .unwrap();
     let program: &mut Xdp = bpf.program_mut("xsk_def_prog").unwrap().try_into().unwrap();
     program.load().unwrap();
-    program.attach(interface, XdpMode::Driver).unwrap();
+    program.attach(interface, XdpMode::Default).unwrap();
     if let Err(e) = EbpfLogger::init(&mut bpf) {
         eprintln!("Failed to initialize eBPF logger: {}", e);
     }
@@ -538,7 +540,19 @@ async fn async_main() {
                     std::thread::scope(|s| {
                         let umem_ref = &umem;
                         s.spawn(move || {
-                            recv(rx_q, fq, &mut rx_desc, umem_ref, &ips_clone);
+                            recv(
+                                rx_q,
+                                fq,
+                                &mut rx_desc,
+                                umem_ref,
+                                &ips_clone,
+                                if args.file != "" {
+                                    Some(&args.file)
+                                } else {
+                                    None
+                                },
+                                args.quiet,
+                            );
                         });
                         let ip_ref = ip_chunk;
                         let ports_clone = ports.clone();
