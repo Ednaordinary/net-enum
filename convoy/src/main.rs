@@ -1,10 +1,8 @@
 extern crate pnet;
 
-use aya::maps::{MapData, MapError};
 use ipnet::Ipv4Net;
 use iprange::IpRange;
 use pnet::datalink::{NetworkInterface, interfaces};
-use pnet::packet::tcp::TcpOption;
 use pnet::packet::{
     MutablePacket, Packet,
     ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket},
@@ -15,16 +13,14 @@ use pnet::packet::{
 use pnet::util::MacAddr;
 use pnet_macros_support::types::u16be;
 
-use xsk_rs::config::{FrameSize, LibxdpFlags, QueueSize, SocketConfig, UmemConfig, XdpFlags};
+use xsk_rs::config::{FrameSize, LibxdpFlags, QueueSize, SocketConfig, UmemConfig};
 use xsk_rs::{CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem};
 
-use std::env;
 use std::fmt::Debug;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aya::{
@@ -36,8 +32,6 @@ use aya_log::EbpfLogger;
 
 use anyhow::Result;
 use clap::Parser;
-use itertools::Itertools;
-use rand::seq::IteratorRandom;
 
 mod lib;
 
@@ -52,9 +46,9 @@ struct Args {
     #[arg(short, long)]
     range: String,
 
-    /// TX queues to use
-    #[arg(long, default_value_t = 1)]
-    tx: u8,
+    /// Queue ID to use.
+    #[arg(long, default_value_t = 0)]
+    tx: u32,
 
     /// Port range start
     #[arg(short)]
@@ -104,7 +98,7 @@ fn toggle_capture_port(
 
 fn handle_recv(
     packet: &[u8],
-    range: &Ipv4Net,
+    range: &IpRange<Ipv4Net>,
     dedupe: &mut Dedupe<Metadata, 4096>,
     file: Option<&str>,
     quiet: &bool,
@@ -149,7 +143,7 @@ fn recv(
     mut fq: FillQueue,
     descs: &mut [FrameDesc],
     umem: &Umem,
-    range: &Ipv4Net,
+    range: &IpRange<Ipv4Net>,
     file: Option<&str>,
     quiet: bool,
 ) {
@@ -274,7 +268,7 @@ fn fill_descs(
 
 fn send_packets(
     source_ip: &Ipv4Addr,
-    remote_ips: &Vec<Ipv4Net>,
+    remote_ips: &IpRange<Ipv4Net>,
     source_port: u16,
     remote_ports: Vec<u16>,
     gate_mac: MacAddr,
@@ -283,7 +277,6 @@ fn send_packets(
     mut tx_q: TxQueue,
     cq: &mut CompQueue,
     descs: &mut [FrameDesc],
-    send_mul: u32,
 ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let mut part_sum = ipv4_word_sum(source_ip);
     let IpNextHeaderProtocol(protocol) = IpNextHeaderProtocols::Tcp;
@@ -320,9 +313,9 @@ fn send_packets(
         .sum::<u32>();
     let mut available = descs.len();
     let mut all_sent: u64 = 0;
-    let mut consumed: usize;
-    let mut percent: u64;
-    let mut last_percent: u64 = 0;
+    let _consumed: usize;
+    let mut percent: f64;
+    let mut last_percent: f64 = 0.0;
     for port in remote_ports.iter() {
         println!("Port {}", port);
         let mut sent: u32 = 0;
@@ -330,7 +323,7 @@ fn send_packets(
             let mut base_packet = MutableTcpPacket::new(ip_packet.payload_mut()).unwrap();
             base_packet.set_destination(*port);
         }
-        let mut hosts = remote_ips.into_iter().map(|x| x.hosts()).flatten();
+        let mut hosts = remote_ips.iter().map(|x| x.hosts()).flatten();
         unsafe {
             loop {
                 while available == 0 {
@@ -371,9 +364,9 @@ fn send_packets(
                 let consumed = cq.consume(&mut descs[..]);
                 sent += consumed as u32;
                 available += consumed;
-                percent = sent as u64 * 100 / req as u64;
-                if percent != last_percent {
-                    print!("{}%      \r", sent * 100 / req);
+                percent = sent as f64 * 100.0 / req as f64;
+                if (percent * 100.0).round() / 100.0 != (last_percent * 100.0).round() / 100.0 {
+                    print!("{:.2}%      \r", percent);
                     std::io::stdout().flush().unwrap();
                 }
                 last_percent = percent;
@@ -498,24 +491,15 @@ async fn async_main() {
             .mac_addr
             .octets(),
     );
-    let chunk_prefix = std::cmp::min(32, ips.prefix_len() + args.tx.ilog2() as u8);
-    let chunk_amt = 2_i32.pow((chunk_prefix - ips.prefix_len()) as u32);
-    let ip_chunks = ips.subnets(chunk_prefix).unwrap();
-    let ip_chunks: Vec<Vec<Ipv4Net>> = ip_chunks
-        .map(|x| {
-            let mut range: IpRange<Ipv4Net> = IpRange::new();
-            range.add(x);
-            excl.iter().for_each(|y| {
-                let mut yrange = IpRange::new();
-                yrange.add(*y);
-                range = range.exclude(&yrange);
-            });
-            range.into_iter().collect()
-        })
-        .collect();
+    let mut ip_chunks: IpRange<Ipv4Net> = IpRange::new();
+    ip_chunks.add(ips);
+    excl.iter().for_each(|y| {
+        let mut yrange = IpRange::new();
+        yrange.add(*y);
+        ip_chunks = ip_chunks.exclude(&yrange);
+    });
     let ip = interface.ips.first().unwrap().ip();
     println!("if: {}", interface.name);
-    let mut q_id: u32 = 0;
     let mut ebpf = inject_ebpf(&interface.name);
     ports
         .iter()
@@ -523,95 +507,60 @@ async fn async_main() {
     match ip {
         IpAddr::V4(v4_addr) => {
             println!("{}", v4_addr);
-            for ip_chunk in ip_chunks {
-                if q_id == (chunk_amt - 1) as u32 {
-                    let ((tx_q, rx_q, fq_cq), umem, mut descs) = make_socket(
-                        &interface,
-                        2u32.pow(args.u as u32),
-                        2u32.pow(args.q as u32),
-                        2u32.pow(args.q as u32),
-                        q_id,
-                        &mut ebpf,
+            let ((tx_q, rx_q, fq_cq), umem, mut descs) = make_socket(
+                &interface,
+                2u32.pow(args.u as u32),
+                2u32.pow(args.q as u32),
+                2u32.pow(args.q as u32),
+                args.tx,
+                &mut ebpf,
+            );
+            let desc_len = descs.len();
+            let (mut rx_desc, mut tx_desc) = descs.split_at_mut(desc_len / 2);
+            let (fq, mut cq) = fq_cq.unwrap();
+            std::thread::scope(|s| {
+                let umem_ref = &umem;
+                let ip_ref = ip_chunks.clone();
+                s.spawn(move || {
+                    recv(
+                        rx_q,
+                        fq,
+                        &mut rx_desc,
+                        umem_ref,
+                        &ip_ref,
+                        if args.file != "" {
+                            Some(&args.file)
+                        } else {
+                            None
+                        },
+                        args.quiet,
                     );
-                    let desc_len = descs.len();
-                    let (mut rx_desc, mut tx_desc) = descs.split_at_mut(desc_len / 2);
-                    let (fq, mut cq) = fq_cq.unwrap();
-                    let ips_clone = ips.clone();
-                    std::thread::scope(|s| {
-                        let umem_ref = &umem;
-                        s.spawn(move || {
-                            recv(
-                                rx_q,
-                                fq,
-                                &mut rx_desc,
-                                umem_ref,
-                                &ips_clone,
-                                if args.file != "" {
-                                    Some(&args.file)
-                                } else {
-                                    None
-                                },
-                                args.quiet,
-                            );
-                        });
-                        let ip_ref = ip_chunk;
-                        let ports_clone = ports.clone();
-                        let start = Instant::now();
-                        let (packets, req) = send_packets(
-                            &v4_addr,
-                            &ip_ref,
-                            34567,
-                            ports_clone,
-                            gate_mac,
-                            mac,
-                            &umem,
-                            tx_q,
-                            &mut cq,
-                            &mut tx_desc,
-                            args.tx as u32,
-                        )
-                        .unwrap();
-                        let elapsed = start.elapsed().as_secs_f64();
-                        std::thread::sleep(Duration::from_secs(2));
-                        println!("Packets requested: {}", req);
-                        println!("Packets sent: {}", packets);
-                        println!("Total real size (bytes): {}", packets * 54);
-                        println!("Elapsed: {:.2}", elapsed);
-                        // This is safe. packets will never exceed 2^48 so it fits in f64 mantissa
-                        println!("Final pps {:.2}", packets as f64 / elapsed);
-                        std::process::exit(0);
-                    });
-                } else {
-                    let ((tx_q, _rx_q, fq_cq), umem, mut descs) = make_socket(
-                        &interface,
-                        2u32.pow(args.u as u32),
-                        2u32.pow(args.q as u32),
-                        2u32.pow(args.q as u32),
-                        q_id,
-                        &mut ebpf,
-                    );
-                    let (_fq, mut cq) = fq_cq.unwrap();
-                    let ip_ref = ip_chunk;
-                    let ports_clone = ports.clone();
-                    tokio::task::spawn_blocking(move || {
-                        send_packets(
-                            &v4_addr,
-                            &ip_ref,
-                            34567,
-                            ports_clone,
-                            gate_mac,
-                            mac,
-                            &umem,
-                            tx_q,
-                            &mut cq,
-                            &mut descs,
-                            0,
-                        )
-                        .unwrap();
-                    });
-                }
-                q_id += 1;
-            }
+                });
+                let ports_clone = ports.clone();
+                let start = Instant::now();
+                let (packets, req) = send_packets(
+                    &v4_addr,
+                    &ip_chunks,
+                    34567,
+                    ports_clone,
+                    gate_mac,
+                    mac,
+                    &umem,
+                    tx_q,
+                    &mut cq,
+                    &mut tx_desc,
+                )
+                .unwrap();
+                let elapsed = start.elapsed().as_secs_f64();
+                std::thread::sleep(Duration::from_secs(2));
+                println!("Packets requested: {}", req);
+                println!("Packets sent: {}", packets);
+                println!("Total real size (bytes): {}", packets * 54);
+                println!("Elapsed: {:.2}", elapsed);
+                // This is safe. packets will never exceed 2^48 so it fits in f64 mantissa
+                println!("Final pps {:.2}", packets as f64 / elapsed);
+                std::process::exit(0);
+            });
         }
         IpAddr::V6(_) => {
             println!("Source is v6! Not implemented");
